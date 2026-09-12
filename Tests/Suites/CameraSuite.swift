@@ -135,6 +135,20 @@ do {
     ) == nil, "tiny minimap -> nil")
 }
 
+// ---------- 相机 Codable（存档 manifest 用） ----------
+
+do {
+    let cam = Camera(center: CGPoint(x: 123.5, y: -456.25), scale: 2.5)
+    let data = try JSONEncoder().encode(cam)
+    let back = try JSONDecoder().decode(Camera.self, from: data)
+    check(back == cam, "camera codable roundtrip")
+    // 键稳定：x/y/scale（跨版本可读）
+    let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+    check(obj?.keys.sorted() == ["scale", "x", "y"], "camera keys stable")
+} catch {
+    check(false, "camera codable threw \(error)")
+}
+
 if failures == 0 { print("ALL CAMERA/VIEWPORT TESTS PASSED") }
 else { print("\(failures) FAILURES") }
 exit(failures == 0 ? 0 : 1)

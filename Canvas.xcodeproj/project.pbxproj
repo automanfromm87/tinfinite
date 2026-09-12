@@ -7,7 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		8A3F10080000000000000001 /* CanvasUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A3F10060000000000000001 /* CanvasUITests.swift */; };
+		8A3F10080000000000000001 /* CanvasUITests/CanvasUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A3F10060000000000000001 /* CanvasUITests/CanvasUITests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -23,7 +23,7 @@
 /* Begin PBXFileReference section */
 		572EBD5D3054319600D9BB4F /* Canvas.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Canvas.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		8A3F10020000000000000001 /* CanvasUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = CanvasUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-		8A3F10060000000000000001 /* CanvasUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "CanvasUITests/CanvasUITests.swift"; sourceTree = "<group>"; };
+		8A3F10060000000000000001 /* CanvasUITests/CanvasUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CanvasUITests/CanvasUITests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -57,14 +57,6 @@
 			);
 			sourceTree = "<group>";
 		};
-		8A3F10070000000000000001 /* CanvasUITests */ = {
-			isa = PBXGroup;
-			children = (
-				8A3F10060000000000000001 /* CanvasUITests.swift */,
-			);
-			name = CanvasUITests;
-			sourceTree = "<group>";
-		};
 		572EBD5E3054319600D9BB4F /* Products */ = {
 			isa = PBXGroup;
 			children = (
@@ -74,27 +66,17 @@
 			name = Products;
 			sourceTree = "<group>";
 		};
+		8A3F10070000000000000001 /* CanvasUITests */ = {
+			isa = PBXGroup;
+			children = (
+				8A3F10060000000000000001 /* CanvasUITests/CanvasUITests.swift */,
+			);
+			name = CanvasUITests;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		8A3F10010000000000000001 /* CanvasUITests */ = {
-			isa = PBXNativeTarget;
-			buildConfigurationList = 8A3F10110000000000000001 /* Build configuration list for PBXNativeTarget "CanvasUITests" */;
-			buildPhases = (
-				8A3F10030000000000000001 /* Sources */,
-				8A3F10040000000000000001 /* Frameworks */,
-				8A3F10050000000000000001 /* Resources */,
-			);
-			buildRules = (
-			);
-			dependencies = (
-				8A3F10090000000000000001 /* PBXTargetDependency */,
-			);
-			name = CanvasUITests;
-			productName = CanvasUITests;
-			productReference = 8A3F10020000000000000001 /* CanvasUITests.xctest */;
-			productType = "com.apple.product-type.bundle.ui-testing";
-		};
 		572EBD5C3054319600D9BB4F /* Canvas */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 572EBD683054319600D9BB4F /* Build configuration list for PBXNativeTarget "Canvas" */;
@@ -112,6 +94,24 @@
 			productName = Canvas;
 			productReference = 572EBD5D3054319600D9BB4F /* Canvas.app */;
 			productType = "com.apple.product-type.application";
+		};
+		8A3F10010000000000000001 /* CanvasUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 8A3F10110000000000000001 /* Build configuration list for PBXNativeTarget "CanvasUITests" */;
+			buildPhases = (
+				8A3F10030000000000000001 /* Sources */,
+				8A3F10040000000000000001 /* Frameworks */,
+				8A3F10050000000000000001 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				8A3F10090000000000000001 /* PBXTargetDependency */,
+			);
+			name = CanvasUITests;
+			productName = CanvasUITests;
+			productReference = 8A3F10020000000000000001 /* CanvasUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
 		};
 /* End PBXNativeTarget section */
 
@@ -157,17 +157,6 @@
 			files = (
 			);
 		};
-/* End PBXResourcesBuildPhase section */
-
-/* Begin PBXSourcesBuildPhase section */
-		572EBD593054319600D9BB4F /* Sources */ = {
-			isa = PBXSourcesBuildPhase;
-			files = (
-			);
-		};
-/* End PBXSourcesBuildPhase section */
-
-/* Begin PBXResourcesBuildPhase section */
 		8A3F10050000000000000001 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			files = (
@@ -176,13 +165,16 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		572EBD593054319600D9BB4F /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			files = (
+			);
+		};
 		8A3F10030000000000000001 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
-			buildActionMask = 2147483647;
 			files = (
-				8A3F10080000000000000001 /* CanvasUITests.swift in Sources */,
+				8A3F10080000000000000001 /* CanvasUITests/CanvasUITests.swift in Sources */,
 			);
-			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
 

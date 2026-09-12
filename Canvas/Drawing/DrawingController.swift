@@ -666,7 +666,7 @@ final class DrawingController: NSObject {
         let expanded = visible.insetBy(
             dx: -visible.width * 0.1, dy: -visible.height * 0.1
         )
-        let ids = strokes.filter { $0.bounds.intersects(expanded) }.map(\.id)
+        let ids = store.strokeIDs(in: expanded)
         guard !ids.isEmpty else { return }
         let sync = store.retessellate(ids: ids, tolerance: StrokeGeometry.lodTolerance(
             forScale: scale, screenError: lodScreenError

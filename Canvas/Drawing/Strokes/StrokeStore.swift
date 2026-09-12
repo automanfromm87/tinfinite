@@ -44,6 +44,9 @@ nonisolated struct StrokeStore: Sendable {
     private var redoStack: [UndoEntry] = []
     /// 当前 tessellation 容差（提交/LOD 时更新；缓存缺失时重建用）
     private var currentTolerance: CGFloat = 0.35
+    /// 空间网格：所有增删改（正向 + undo/redo）都必须同步维护；
+    /// 只做候选过滤，精确判定仍由 spine 级测试完成，语义与暴力扫描一致
+    private var grid = StrokeSpatialGrid()
 
     var canUndo: Bool { !undoStack.isEmpty }
     var canRedo: Bool { !redoStack.isEmpty }
@@ -62,6 +65,7 @@ nonisolated struct StrokeStore: Sendable {
         let stroke = Stroke(points: rawPoints, style: style, bounds: StrokeGeometry.bounds(of: spine), spine: spine)
         strokes.append(stroke)
         meshes[stroke.id] = mesh
+        grid.insert(id: stroke.id, bounds: stroke.bounds)
         pushUndo(.added(stroke: stroke))
         return (stroke, RenderSync(upserts: [RenderedStroke(id: stroke.id, mesh: mesh, bounds: stroke.bounds)]))
     }
@@ -117,6 +121,7 @@ nonisolated struct StrokeStore: Sendable {
         let items = strokes.enumerated().map { IndexedStroke(index: $0.offset, stroke: $0.element) }
         let ids = strokes.map(\.id)
         strokes.removeAll()
+        grid.removeAll()
         pushUndo(.removed(items: items))
         sanitizeSelection()
         sweepMeshCache()
@@ -128,8 +133,10 @@ nonisolated struct StrokeStore: Sendable {
     /// 整笔擦：删除被路径命中的笔画（一步 undo）
     mutating func eraseStrokes(path: [CGPoint], radius: CGFloat) -> RenderSync {
         guard path.count >= 2 else { return .empty }
+        let candidates = eraseCandidates(path: path, radius: radius)
         var hitIndices: [Int] = []
         for (i, s) in strokes.enumerated() {
+            guard candidates == nil || candidates!.contains(s.id) else { continue }
             if EraserHitTest.strokeHit(spine: s.spine, path: path, eraserRadius: radius) {
                 hitIndices.append(i)
             }
@@ -138,6 +145,7 @@ nonisolated struct StrokeStore: Sendable {
         let items = hitIndices.map { IndexedStroke(index: $0, stroke: strokes[$0]) }
         let ids = Set(items.map { $0.stroke.id })
         strokes.removeAll { ids.contains($0.id) }
+        for id in ids { grid.remove(id: id) }
         pushUndo(.removed(items: items))
         sanitizeSelection()
         sweepMeshCache()
@@ -148,14 +156,17 @@ nonisolated struct StrokeStore: Sendable {
     mutating func erasePartial(path: [CGPoint], radius: CGFloat, tolerance: CGFloat) -> RenderSync {
         guard path.count >= 2 else { return .empty }
         currentTolerance = tolerance
+        let candidates = eraseCandidates(path: path, radius: radius)
         var entries: [UndoEntry] = []
         var removed: [UUID] = []
         var upserts: [RenderedStroke] = []
         // 从后往前，保证 index 有效；undo 时按原升序恢复
         for i in strokes.indices.reversed() {
             let s = strokes[i]
+            guard candidates == nil || candidates!.contains(s.id) else { continue }
             let runs = EraserHitTest.eraseRuns(spine: s.spine, path: path, eraserRadius: radius)
             if runs.count == 1 && runs[0].count == s.spine.count { continue }
+            grid.remove(id: s.id)
             if runs.isEmpty {
                 strokes.remove(at: i)
                 entries.append(.removed(items: [IndexedStroke(index: i, stroke: s)]))
@@ -168,6 +179,7 @@ nonisolated struct StrokeStore: Sendable {
                 removed.append(s.id)
                 for f in frags {
                     meshes[f.stroke.id] = f.mesh
+                    grid.insert(id: f.stroke.id, bounds: f.stroke.bounds)
                     upserts.append(RenderedStroke(id: f.stroke.id, mesh: f.mesh, bounds: f.stroke.bounds))
                 }
             }
@@ -208,7 +220,9 @@ nonisolated struct StrokeStore: Sendable {
         var result = Set<UUID>()
         if loop.count >= 3 {
             let loopBounds = Self.boundingBox(of: loop)
+            let candidates = grid.strokes(in: loopBounds)
             for s in strokes {
+                guard candidates == nil || candidates!.contains(s.id) else { continue }
                 guard s.bounds.intersects(loopBounds) else { continue }
                 if LassoHitTest.strokeIntersectsLoop(spine: s.spine, loop: loop) {
                     result.insert(s.id)
@@ -222,7 +236,9 @@ nonisolated struct StrokeStore: Sendable {
     /// 点选：返回选中的 id（最多一个，最上层）
     mutating func selectTap(at worldPoint: CGPoint, radius: CGFloat) -> Set<UUID> {
         var result = Set<UUID>()
+        let candidates = grid.strokes(near: worldPoint, radius: radius)
         for s in strokes.reversed() {
+            guard candidates == nil || candidates!.contains(s.id) else { continue }
             if LassoHitTest.tapHit(spine: s.spine, point: worldPoint, radius: radius) {
                 result = [s.id]
                 break
@@ -230,6 +246,15 @@ nonisolated struct StrokeStore: Sendable {
         }
         selection = result
         return result
+    }
+
+    /// 矩形相交的笔画 id（数组顺序 = z 序；网格候选 + 精确 bbox 复核）。
+    /// LOD 可见集等调用方用；nil 回退时与暴力扫描结果一致。
+    func strokeIDs(in rect: CGRect) -> [UUID] {
+        guard let candidates = grid.strokes(in: rect) else {
+            return strokes.filter { $0.bounds.intersects(rect) }.map(\.id)
+        }
+        return strokes.filter { candidates.contains($0.id) && $0.bounds.intersects(rect) }.map(\.id)
     }
 
     mutating func clearSelection() {
@@ -263,6 +288,7 @@ nonisolated struct StrokeStore: Sendable {
         }
         let ids = Set(items.map { $0.stroke.id })
         strokes.removeAll { ids.contains($0.id) }
+        for id in ids { grid.remove(id: id) }
         pushUndo(.removed(items: items))
         selection.removeAll()
         sweepMeshCache()
@@ -336,6 +362,7 @@ nonisolated struct StrokeStore: Sendable {
                 spine: strokes[i].spine, color: strokes[i].style.color, flattenTolerance: tolerance
             )
         }
+        grid.rebuild(strokes: strokes.map { (id: $0.id, bounds: $0.bounds) })
     }
 
     // MARK: - Undo 引擎
@@ -354,11 +381,13 @@ nonisolated struct StrokeStore: Sendable {
         case .added(let stroke):
             guard let idx = indexOf(id: stroke.id) else { return .empty }
             strokes.remove(at: idx)
+            grid.remove(id: stroke.id)
             return RenderSync(removedIDs: [stroke.id])
         case .removed(let items):
             var upserts: [RenderedStroke] = []
             for item in items.sorted(by: { $0.index < $1.index }) {
                 strokes.insert(item.stroke, at: min(item.index, strokes.count))
+                grid.insert(id: item.stroke.id, bounds: item.stroke.bounds)
                 let mesh = meshFor(item.stroke)
                 meshes[item.stroke.id] = mesh
                 upserts.append(RenderedStroke(id: item.stroke.id, mesh: mesh, bounds: item.stroke.bounds))
@@ -367,7 +396,9 @@ nonisolated struct StrokeStore: Sendable {
         case .replaced(let index, let original, let fragments):
             let fragIDs = Set(fragments.map(\.id))
             strokes.removeAll { fragIDs.contains($0.id) }
+            for id in fragIDs { grid.remove(id: id) }
             strokes.insert(original, at: min(index, strokes.count))
+            grid.insert(id: original.id, bounds: original.bounds)
             let mesh = meshFor(original)
             meshes[original.id] = mesh
             return RenderSync(
@@ -393,18 +424,22 @@ nonisolated struct StrokeStore: Sendable {
         switch entry {
         case .added(let stroke):
             strokes.append(stroke)
+            grid.insert(id: stroke.id, bounds: stroke.bounds)
             let mesh = meshFor(stroke)
             meshes[stroke.id] = mesh
             return RenderSync(upserts: [RenderedStroke(id: stroke.id, mesh: mesh, bounds: stroke.bounds)])
         case .removed(let items):
             let ids = Set(items.map { $0.stroke.id })
             strokes.removeAll { ids.contains($0.id) }
+            for id in ids { grid.remove(id: id) }
             return RenderSync(removedIDs: Array(ids))
         case .replaced(let index, let original, let fragments):
             strokes.removeAll { $0.id == original.id }
+            grid.remove(id: original.id)
             var upserts: [RenderedStroke] = []
             for (offset, frag) in fragments.enumerated() {
                 strokes.insert(frag, at: min(index + offset, strokes.count))
+                grid.insert(id: frag.id, bounds: frag.bounds)
                 let mesh = meshFor(frag)
                 meshes[frag.id] = mesh
                 upserts.append(RenderedStroke(id: frag.id, mesh: mesh, bounds: frag.bounds))
@@ -428,7 +463,9 @@ nonisolated struct StrokeStore: Sendable {
         let set = Set(ids)
         var result: [InPlaceMesh] = []
         for i in strokes.indices where set.contains(strokes[i].id) {
+            let oldBounds = strokes[i].bounds
             strokes[i] = Self.offsetStroke(strokes[i], by: delta)
+            grid.move(id: strokes[i].id, from: oldBounds, to: strokes[i].bounds)
             let mesh = StrokeGeometry.translated(meshFor(strokes[i]), by: delta)
             meshes[strokes[i].id] = mesh
             result.append(InPlaceMesh(id: strokes[i].id, mesh: mesh, bounds: strokes[i].bounds))
@@ -495,4 +532,16 @@ nonisolated struct StrokeStore: Sendable {
         }
         return rect
     }
+
+    /// 橡皮路径候选集（路径 bbox 外扩半径；nil = 回退全量扫描）
+    private func eraseCandidates(path: [CGPoint], radius: CGFloat) -> Set<UUID>? {
+        let box = Self.boundingBox(of: path)
+        guard !box.isNull, radius.isFinite, radius >= 0 else { return nil }
+        return grid.strokes(in: box.insetBy(dx: -radius, dy: -radius))
+    }
+
+    #if DEBUG
+    /// 自检用：网格内笔画数（与 strokes.count 对照，验证索引同步）
+    var gridCountForTest: Int { grid.count }
+    #endif
 }

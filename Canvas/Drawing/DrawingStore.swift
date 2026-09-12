@@ -76,14 +76,27 @@ nonisolated enum DrawingStore {
         directory.appendingPathComponent("\(id.uuidString).bak.json", isDirectory: false)
     }
 
-    /// 加载目录下所有文档（逐个容错：坏文件先试 .bak 恢复，实在不行跳过并打印）
+    /// 加载目录下所有文档（逐个容错）：
+    /// - v2 子目录：按 manifest 加载
+    /// - v1 单文件：解码后就地迁移到 v2（一次性），失败则保留 v1 下次重试
+    /// 坏文件先试备份恢复，实在不行跳过并打印。
     static func loadAllDocuments(from directory: URL) -> [CanvasDocument] {
         guard let files = try? FileManager.default.contentsOfDirectory(
-            at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
+            at: directory, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]
         ) else { return [] }
         var docs: [CanvasDocument] = []
-        for url in files where url.pathExtension == "json" && !url.lastPathComponent.hasSuffix(".bak.json") {
+        for url in files {
+            let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+            if isDir {
+                if let id = UUID(uuidString: url.lastPathComponent),
+                   let doc = loadDocumentV2(id: id, from: directory) {
+                    docs.append(doc)
+                }
+                continue
+            }
+            guard url.pathExtension == "json", !url.lastPathComponent.hasSuffix(".bak.json") else { continue }
             if let doc = loadDocumentWithBackup(at: url) {
+                migrateV1toV2(doc: doc, v1URL: url, in: directory)
                 docs.append(doc)
             }
         }
@@ -118,6 +131,161 @@ nonisolated enum DrawingStore {
     static func deleteDocument(id: UUID, in directory: URL) {
         try? FileManager.default.removeItem(at: documentURL(id: id, in: directory))
         try? FileManager.default.removeItem(at: backupURL(id: id, in: directory))
+        try? FileManager.default.removeItem(at: docDirectory(id: id, in: directory))
+    }
+
+    // MARK: - 增量存档（v2 目录布局）
+
+    /// v2 布局：documents/<uuid>/{manifest.json, manifest.bak.json, nodes.json, strokes/<sid>.json}。
+    /// 与 v1（整档单文件）正交：只改变文件组织，不改变模型语义。
+    /// - manifest：版本 + 元信息 + 相机 + 笔画 id 有序表（z 序），每次存档重写（附 .bak 轮转）
+    /// - strokes/：每笔独立文件，只写变更的笔；缺失/损坏的笔加载时跳过并打印
+    /// - nodes.json：整体重写（节点数量级小，全量可接受）
+    static let layoutVersion = 2
+
+    nonisolated struct ManifestV2: Codable, Sendable, Equatable {
+        var version: Int
+        var meta: CanvasDocumentMeta
+        var camera: Camera?
+        /// 笔画 id（数组顺序 = z 序）
+        var strokeIDs: [UUID]
+    }
+
+    static func docDirectory(id: UUID, in directory: URL) -> URL {
+        directory.appendingPathComponent(id.uuidString, isDirectory: true)
+    }
+
+    static func manifestURL(docID: UUID, in directory: URL) -> URL {
+        docDirectory(id: docID, in: directory).appendingPathComponent("manifest.json", isDirectory: false)
+    }
+
+    static func backupManifestURL(docID: UUID, in directory: URL) -> URL {
+        docDirectory(id: docID, in: directory).appendingPathComponent("manifest.bak.json", isDirectory: false)
+    }
+
+    static func nodesURL(docID: UUID, in directory: URL) -> URL {
+        docDirectory(id: docID, in: directory).appendingPathComponent("nodes.json", isDirectory: false)
+    }
+
+    static func strokesDirectory(docID: UUID, in directory: URL) -> URL {
+        docDirectory(id: docID, in: directory).appendingPathComponent("strokes", isDirectory: true)
+    }
+
+    static func strokeURL(docID: UUID, strokeID: UUID, in directory: URL) -> URL {
+        strokesDirectory(docID: docID, in: directory).appendingPathComponent("\(strokeID.uuidString).json", isDirectory: false)
+    }
+
+    /// 写单笔（增量存档的基本单位；调用方保证 manifest 随后更新）
+    static func saveStroke(_ stroke: Stroke, docID: UUID, in directory: URL) throws {
+        let dir = strokesDirectory(docID: docID, in: directory)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let data = try JSONEncoder().encode(stroke)
+        try data.write(to: strokeURL(docID: docID, strokeID: stroke.id, in: directory), options: .atomic)
+    }
+
+    /// 删若干笔文件（逐个容错：有一个删不掉不影响其他）
+    static func removeStrokeFiles(docID: UUID, ids: [UUID], in directory: URL) {
+        for id in ids {
+            try? FileManager.default.removeItem(at: strokeURL(docID: docID, strokeID: id, in: directory))
+        }
+    }
+
+    static func saveNodes(_ nodes: [ContentNode], docID: UUID, in directory: URL) throws {
+        let dir = docDirectory(id: docID, in: directory)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let data = try JSONEncoder().encode(nodes)
+        try data.write(to: nodesURL(docID: docID, in: directory), options: .atomic)
+    }
+
+    /// 写 manifest（附 .bak 轮转：manifest 是整档的索引，必须可恢复）
+    static func saveManifest(meta: CanvasDocumentMeta, camera: Camera?, strokeIDs: [UUID], docID: UUID, in directory: URL) throws {
+        let dir = docDirectory(id: docID, in: directory)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = manifestURL(docID: docID, in: directory)
+        if FileManager.default.fileExists(atPath: url.path) {
+            let bak = backupManifestURL(docID: docID, in: directory)
+            try? FileManager.default.removeItem(at: bak)
+            try? FileManager.default.copyItem(at: url, to: bak)
+        }
+        let manifest = ManifestV2(version: layoutVersion, meta: meta, camera: camera, strokeIDs: strokeIDs)
+        let data = try JSONEncoder().encode(manifest)
+        try data.write(to: url, options: .atomic)
+    }
+
+    /// 全量写 v2（迁移/兜底用）：笔画 + 节点 + manifest（manifest 最后写）
+    static func writeFullV2(doc: CanvasDocument, in directory: URL) throws {
+        for s in doc.strokes {
+            try saveStroke(s, docID: doc.meta.id, in: directory)
+        }
+        try saveNodes(doc.nodes, docID: doc.meta.id, in: directory)
+        try saveManifest(meta: doc.meta, camera: doc.camera, strokeIDs: doc.strokes.map(\.id), docID: doc.meta.id, in: directory)
+    }
+
+    /// 加载单个 v2 文档：manifest 缺失/损坏（连 .bak 都不行）返回 nil；
+    /// 缺失/损坏的单笔跳过并打印，不影响整档。
+    static func loadDocumentV2(id: UUID, from directory: URL) -> CanvasDocument? {
+        guard let manifest = loadManifestV2(docID: id, in: directory) else { return nil }
+        let nodes: [ContentNode]
+        do {
+            let data = try Data(contentsOf: nodesURL(docID: id, in: directory))
+            nodes = try JSONDecoder().decode([ContentNode].self, from: data)
+        } catch {
+            if (error as NSError).code != NSFileReadNoSuchFileError {
+                print("[DrawingStore] \(id.uuidString): bad nodes.json (\(error)), use empty")
+            }
+            nodes = []
+        }
+        var strokes: [Stroke] = []
+        strokes.reserveCapacity(manifest.strokeIDs.count)
+        for sid in manifest.strokeIDs {
+            do {
+                let data = try Data(contentsOf: strokeURL(docID: id, strokeID: sid, in: directory))
+                strokes.append(try JSONDecoder().decode(Stroke.self, from: data))
+            } catch {
+                print("[DrawingStore] \(id.uuidString): skip unreadable stroke \(sid) (\(error))")
+            }
+        }
+        return CanvasDocument(meta: manifest.meta, strokes: strokes, nodes: nodes, camera: manifest.camera)
+    }
+
+    private static func loadManifestV2(docID: UUID, in directory: URL) -> ManifestV2? {
+        let url = manifestURL(docID: docID, in: directory)
+        do {
+            return try loadOneManifest(at: url)
+        } catch let original {
+            do {
+                let m = try loadOneManifest(at: backupManifestURL(docID: docID, in: directory))
+                print("[DrawingStore] recovered manifest for \(docID.uuidString) from backup")
+                return m
+            } catch {
+                print("[DrawingStore] skip unreadable manifest for \(docID.uuidString): \(original)")
+                return nil
+            }
+        }
+    }
+
+    private static func loadOneManifest(at url: URL) throws -> ManifestV2 {
+        let data = try Data(contentsOf: url)
+        let manifest = try JSONDecoder().decode(ManifestV2.self, from: data)
+        guard manifest.version == layoutVersion else {
+            throw StoreError.unsupportedVersion(manifest.version)
+        }
+        return manifest
+    }
+
+    /// v1 单文件迁移到 v2（加载时触发，一次性）：写完 v2 后删除 v1 主文件 + 备份；
+    /// 写失败则保留 v1，下次启动重试。
+    static func migrateV1toV2(doc: CanvasDocument, v1URL: URL, in directory: URL) {
+        do {
+            try writeFullV2(doc: doc, in: directory)
+            try? FileManager.default.removeItem(at: v1URL)
+            let bak = v1URL.deletingLastPathComponent()
+                .appendingPathComponent("\(v1URL.deletingPathExtension().lastPathComponent).bak.json")
+            try? FileManager.default.removeItem(at: bak)
+            print("[DrawingStore] migrated \(v1URL.lastPathComponent) to v2 layout")
+        } catch {
+            print("[DrawingStore] v1->v2 migration failed for \(v1URL.lastPathComponent): \(error)")
+        }
     }
 
     // MARK: - 节点图片

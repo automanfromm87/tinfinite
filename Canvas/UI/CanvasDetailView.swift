@@ -18,9 +18,26 @@ struct CanvasDetailView: View {
     @State private var showMinimap = false
     @State private var renaming = false
     @State private var renameText = ""
+    /// 相机恢复只做一次（避免 onAppear 重复触发把用户视角拽回旧值）
+    @State private var cameraRestored = false
+    @State private var cameraSaveTask: Task<Void, Never>?
 
     private var title: String {
         library.document(id: documentID)?.meta.title ?? ""
+    }
+
+    /// 相机防抖存档：手势中 camera 高频变化，每次取消重约，只在静止 800ms 后落盘一次。
+    /// updateCamera 内部对未变内容是 O(n) 指针级比较 + 只重写 manifest 小文件。
+    @MainActor
+    private func persistCameraDebounced() {
+        cameraSaveTask?.cancel()
+        let id = documentID
+        let snapshot = model.camera
+        cameraSaveTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            guard !Task.isCancelled else { return }
+            library.updateCamera(id: id, camera: snapshot)
+        }
     }
 
     /// 适合内容：笔画 + 节点并集完整显示。空画布不做任何事。
@@ -204,7 +221,19 @@ struct CanvasDetailView: View {
             Button("取消", role: .cancel) {}
             Button("确定") { library.rename(id: documentID, title: renameText) }
         }
+        .onChange(of: model.camera) { _, _ in persistCameraDebounced() }
+        .onDisappear {
+            cameraSaveTask?.cancel()
+            library.updateCamera(id: documentID, camera: model.camera)
+        }
         .onAppear {
+            // 恢复上次离开时的视角（只做一次；animated:false 不依赖 viewport 尺寸）
+            if !cameraRestored {
+                cameraRestored = true
+                if let saved = library.document(id: documentID)?.camera {
+                    model.setCamera(saved, animated: false)
+                }
+            }
             #if DEBUG
             if CommandLine.arguments.contains("-CanvasSelfTest") {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {

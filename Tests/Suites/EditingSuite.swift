@@ -310,6 +310,7 @@ do {
         lib.updateStrokes(id: a.meta.id, strokes: [strokeA])
         check(lib.documents.first?.meta.id == a.meta.id, "updated moves first")
         check(lib.documents.first?.strokes.count == 1, "strokes cached")
+        lib.flushSaves() // 存档在后台队列，跨实例读盘前必须落盘
 
         let lib2 = CanvasLibrary(directory: dir, legacyURL: nil, autoCreateFirst: false)
         check(lib2.documents.count == 2, "persisted count")
@@ -322,6 +323,7 @@ do {
 
         lib2.delete(id: a.meta.id)
         check(lib2.documents.count == 1, "delete removes")
+        lib2.flushSaves()
         let lib3 = CanvasLibrary(directory: dir, legacyURL: nil, autoCreateFirst: false)
         check(lib3.documents.count == 1, "delete persisted")
 
@@ -339,6 +341,7 @@ do {
     MainActor.assumeIsolated {
         let lib = CanvasLibrary(directory: dir, legacyURL: nil)
         check(lib.documents.count == 1 && lib.documents[0].meta.title == "我的第一张画布", "auto first doc")
+        lib.flushSaves()
         let lib2 = CanvasLibrary(directory: dir, legacyURL: nil)
         check(lib2.documents.count == 1, "no duplicate on reopen")
     }
@@ -556,6 +559,229 @@ do {
     let cMs = Date().timeIntervalSince(c0) * 1000
     print("[perf] content 2000 add/remove/undo=\(Int(cMs))ms")
     check(c.nodes.count == 2000 && cMs < 10_000, "content bulk ops sane")
+}
+
+// ---------- 空间网格 ----------
+
+do {
+    // 基础：插入/查询/删除/负坐标
+    var g = StrokeSpatialGrid()
+    let a = UUID(), b = UUID()
+    g.insert(id: a, bounds: CGRect(x: 0, y: 0, width: 100, height: 100))
+    g.insert(id: b, bounds: CGRect(x: -500, y: -500, width: 10, height: 10))
+    check(g.count == 2, "grid count")
+    let hit = g.strokes(near: CGPoint(x: 50, y: 50), radius: 5)
+    check(hit == Set([a]), "point query hits only a")
+    let miss = g.strokes(near: CGPoint(x: 495, y: 495), radius: 5)
+    check(miss == Set<UUID>(), "point query miss")
+    // 跨格矩形
+    let wide = g.strokes(in: CGRect(x: -600, y: -600, width: 800, height: 800))
+    check(wide == Set([a, b]), "wide rect hits both")
+    // 移动：旧格消失、新格出现
+    g.move(id: a, from: CGRect(x: 0, y: 0, width: 100, height: 100),
+           to: CGRect(x: 1000, y: 1000, width: 100, height: 100))
+    check(g.strokes(near: CGPoint(x: 50, y: 50), radius: 5) == Set<UUID>(), "moved away")
+    check(g.strokes(near: CGPoint(x: 1050, y: 1050), radius: 5) == Set([a]), "moved to")
+    g.remove(id: a)
+    check(g.strokes(near: CGPoint(x: 1050, y: 1050), radius: 5) == Set<UUID>(), "removed gone")
+    check(g.count == 1, "count after remove")
+    // 非法 bounds 进 overflow：任何查询都带上
+    let bad = UUID()
+    g.insert(id: bad, bounds: .null)
+    check(g.strokes(near: CGPoint(x: 9000, y: 9000), radius: 1) == Set([bad]), "null bounds in overflow")
+    // 超大笔画进 overflow
+    let huge = UUID()
+    g.insert(id: huge, bounds: CGRect(x: 0, y: 0, width: 100_000, height: 100_000))
+    let far = g.strokes(near: CGPoint(x: 50_000, y: 50_000), radius: 1)
+    check(far?.contains(huge) == true, "huge stroke always candidate")
+    // 超大查询回退 nil
+    check(g.strokes(in: CGRect(x: 0, y: 0, width: 10_000_000, height: 10_000_000)) == nil, "huge query falls back")
+    g.removeAll()
+    check(g.isEmpty && g.count == 0, "grid cleared")
+}
+
+do {
+    // Store 级：网格与数组在各种变更后保持同步，查询语义与暴力一致
+    var store = StrokeStore()
+    let s1 = addLine(&store, x0: 0, x1: 100, y: 0, n: 11)
+    let s2 = addLine(&store, x0: 0, x1: 100, y: 500, n: 11)
+    // 点选只命中近处笔画（远处 500 外的 s2 不被精确测试也能正确略过）
+    check(store.selectTap(at: CGPoint(x: 50, y: 0), radius: 8) == [s1.id], "tap hits s1")
+    check(store.selectTap(at: CGPoint(x: 50, y: 500), radius: 8) == [s2.id], "tap hits s2")
+    check(store.selectTap(at: CGPoint(x: 50, y: 250), radius: 8).isEmpty, "tap miss")
+    // 套索
+    let loop = [CGPoint(x: -10, y: -10), CGPoint(x: 110, y: -10), CGPoint(x: 110, y: 10), CGPoint(x: -10, y: 10)]
+    check(store.selectLoop(loop) == [s1.id], "loop selects s1 only")
+    // 矩形查询（LOD 可见集路径）
+    check(store.strokeIDs(in: CGRect(x: -50, y: 450, width: 200, height: 100)) == [s2.id], "strokeIDs rect")
+    // 移动后索引跟随
+    _ = store.selectTap(at: CGPoint(x: 50, y: 0), radius: 8)
+    _ = store.commitMoveSelection(by: CGSize(width: 0, height: 500))
+    check(store.selectTap(at: CGPoint(x: 50, y: 0), radius: 8).isEmpty, "moved away from tap")
+    // 撤销恢复索引
+    _ = store.undo()
+    check(store.selectTap(at: CGPoint(x: 50, y: 0), radius: 8) == [s1.id], "undo restores index")
+    // 删除/清空同步
+    _ = store.selectTap(at: CGPoint(x: 50, y: 0), radius: 8)
+    _ = store.deleteSelection()
+    check(store.selectTap(at: CGPoint(x: 50, y: 0), radius: 8).isEmpty, "deleted not hittable")
+    _ = store.clear()
+    check(store.strokeIDs(in: CGRect(x: -10000, y: -10000, width: 20000, height: 20000)).isEmpty, "cleared empty")
+}
+
+do {
+    // 压力：2000 笔分散布局，200 次点选必须毫秒级（网格剪枝；暴力则逐笔走 spine）
+    var store = StrokeStore()
+    for i in 0..<2000 {
+        _ = addLine(&store, x0: CGFloat(i) * 50, x1: CGFloat(i) * 50 + 10, y: 0, n: 6)
+    }
+    let t0 = Date()
+    var hits = 0
+    for i in stride(from: 0, to: 2000, by: 10) {
+        if !store.selectTap(at: CGPoint(x: CGFloat(i) * 50 + 5, y: 0), radius: 8).isEmpty { hits += 1 }
+    }
+    let ms = Date().timeIntervalSince(t0) * 1000
+    print("[perf] grid 200 taps among 2000 strokes=\(Int(ms))ms hits=\(hits)")
+    check(hits == 200 && ms < 5000, "grid tap queries fast and exact")
+}
+
+// ---------- v2 增量存档 ----------
+
+do {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("v2save_\(UUID().uuidString)")
+    var store = StrokeStore()
+    let s1 = addLine(&store, x0: 0, x1: 10, y: 0, n: 6)
+    let s2 = addLine(&store, x0: 0, x1: 10, y: 20, n: 6)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    MainActor.assumeIsolated {
+        let lib = CanvasLibrary(directory: dir, legacyURL: nil, autoCreateFirst: false)
+        let doc = lib.createDocument(title: "v2")
+        lib.updateStrokes(id: doc.meta.id, strokes: [s1, s2])
+        lib.flushSaves()
+        // v2 目录结构落盘
+        let docDir = DrawingStore.docDirectory(id: doc.meta.id, in: dir)
+        check(FileManager.default.fileExists(atPath: docDir.path), "v2 dir exists")
+        check(FileManager.default.fileExists(
+            atPath: DrawingStore.strokeURL(docID: doc.meta.id, strokeID: s1.id, in: dir).path), "stroke file 1")
+        // 快照未变更笔的文件字节
+        let s2URL = DrawingStore.strokeURL(docID: doc.meta.id, strokeID: s2.id, in: dir)
+        let s2Before = try? Data(contentsOf: s2URL)
+        // 追加一笔：只有新笔 + manifest 落盘，旧笔文件逐字节不动
+        let s3 = addLine(&store, x0: 0, x1: 10, y: 40, n: 6)
+        lib.updateStrokes(id: doc.meta.id, strokes: [s1, s2, s3])
+        lib.flushSaves()
+        let s2After = try? Data(contentsOf: s2URL)
+        check(s2Before == s2After && s2Before != nil, "untouched stroke file byte-identical")
+        // 删除一笔：文件消失，manifest 顺序保持 z 序
+        lib.updateStrokes(id: doc.meta.id, strokes: [s1, s3])
+        lib.flushSaves()
+        check(!FileManager.default.fileExists(atPath: s2URL.path), "removed stroke file deleted")
+        let lib2 = CanvasLibrary(directory: dir, legacyURL: nil, autoCreateFirst: false)
+        check(lib2.document(id: doc.meta.id)?.strokes.map(\.id) == [s1.id, s3.id], "v2 reload order + content")
+    }
+    try? FileManager.default.removeItem(at: dir)
+} catch {
+    check(false, "v2 save threw \(error)")
+}
+
+do {
+    // v1 单文件就地迁移到 v2（一次性），坏笔跳过不影响整档
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("v2mig_\(UUID().uuidString)")
+    var store = StrokeStore()
+    let s1 = addLine(&store, x0: 0, x1: 10, y: 0, n: 6)
+    let meta = CanvasDocumentMeta(id: UUID(), title: "v1doc", createdAt: Date(), updatedAt: Date())
+    try DrawingStore.saveDocument(CanvasDocument(meta: meta, strokes: [s1]), to: dir)
+    let v1URL = DrawingStore.documentURL(id: meta.id, in: dir)
+    check(FileManager.default.fileExists(atPath: v1URL.path), "v1 file staged")
+    var docs = DrawingStore.loadAllDocuments(from: dir)
+    check(docs.count == 1 && docs[0].strokes == [s1], "v1 loads")
+    check(!FileManager.default.fileExists(atPath: v1URL.path), "v1 file removed after migration")
+    check(FileManager.default.fileExists(
+        atPath: DrawingStore.manifestURL(docID: meta.id, in: dir).path), "v2 manifest written")
+    // 幂等：再次加载结果一致
+    docs = DrawingStore.loadAllDocuments(from: dir)
+    check(docs.count == 1 && docs[0].strokes == [s1], "v2 reload stable")
+    // 删一笔文件：加载跳过，其余正常
+    try? FileManager.default.removeItem(
+        at: DrawingStore.strokeURL(docID: meta.id, strokeID: s1.id, in: dir))
+    docs = DrawingStore.loadAllDocuments(from: dir)
+    check(docs.count == 1 && docs[0].strokes.isEmpty, "missing stroke skipped")
+    // 坏 manifest 回退 .bak（先复写一次 manifest 以产生备份）
+    try DrawingStore.saveManifest(
+        meta: docs[0].meta, camera: nil, strokeIDs: [s1.id], docID: meta.id, in: dir)
+    let mURL = DrawingStore.manifestURL(docID: meta.id, in: dir)
+    check(FileManager.default.fileExists(
+        atPath: DrawingStore.backupManifestURL(docID: meta.id, in: dir).path), "manifest backup exists")
+    try? "garbage{{".write(to: mURL, atomically: true, encoding: .utf8)
+    docs = DrawingStore.loadAllDocuments(from: dir)
+    check(docs.count == 1, "manifest backup recovered")
+    try? FileManager.default.removeItem(at: dir)
+} catch {
+    check(false, "v2 migration threw \(error)")
+}
+
+do {
+    // 规模：500 笔 v2 写 + 读计时（只记日志 + 宽上限，防离谱退化）
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("v2perf_\(UUID().uuidString)")
+    var store = StrokeStore()
+    for i in 0..<500 {
+        _ = addLine(&store, x0: CGFloat(i), x1: CGFloat(i) + 10, y: 0, n: 11)
+    }
+    let meta = CanvasDocumentMeta(id: UUID(), title: "perf", createdAt: Date(), updatedAt: Date())
+    let t0 = Date()
+    try DrawingStore.writeFullV2(doc: CanvasDocument(meta: meta, strokes: store.strokes), in: dir)
+    let wMs = Date().timeIntervalSince(t0) * 1000
+    let t1 = Date()
+    let docs = DrawingStore.loadAllDocuments(from: dir)
+    let rMs = Date().timeIntervalSince(t1) * 1000
+    print("[perf] v2 500 strokes write=\(Int(wMs))ms read=\(Int(rMs))ms")
+    check(docs.count == 1 && docs[0].strokes.count == 500, "v2 bulk roundtrip")
+    check(wMs < 30_000 && rMs < 30_000, "v2 bulk sane")
+    try? FileManager.default.removeItem(at: dir)
+} catch {
+    check(false, "v2 perf threw \(error)")
+}
+
+do {
+    // 相机持久化：updateCamera 只重写 manifest，不碰 updatedAt/排序/笔画文件；重载后视角恢复
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("campersist_\(UUID().uuidString)")
+    var store = StrokeStore()
+    let s1 = addLine(&store, x0: 0, x1: 10, y: 0, n: 6)
+    let s1URL: URL = MainActor.assumeIsolated {
+        let lib = CanvasLibrary(directory: dir, legacyURL: nil, autoCreateFirst: true)
+        let doc = lib.createDocument(title: "camdoc")
+        lib.updateStrokes(id: doc.meta.id, strokes: [s1])
+        lib.flushSaves()
+        return DrawingStore.strokeURL(docID: doc.meta.id, strokeID: s1.id, in: dir)
+    }
+    let s1Before = try? Data(contentsOf: s1URL)
+    var beforeUpdated: Date?
+    MainActor.assumeIsolated {
+        let lib = CanvasLibrary(directory: dir, legacyURL: nil, autoCreateFirst: false)
+        let doc = lib.document(id: lib.documents.first!.meta.id) ?? lib.documents.first!
+        beforeUpdated = doc.meta.updatedAt
+        let cam = Camera(center: CGPoint(x: 123.5, y: -456.25), scale: 2.5)
+        lib.updateCamera(id: doc.meta.id, camera: cam)
+        lib.flushSaves()
+        let after = lib.document(id: doc.meta.id)!
+        check(after.camera == cam, "camera cached in memory")
+        check(after.meta.updatedAt == beforeUpdated, "camera save keeps updatedAt")
+        // 相同值重复存档：manifest 字节不变（无冗余写）
+        let mURL = DrawingStore.manifestURL(docID: doc.meta.id, in: dir)
+        let mBefore = try? Data(contentsOf: mURL)
+        lib.updateCamera(id: doc.meta.id, camera: cam)
+        lib.flushSaves()
+        check((try? Data(contentsOf: mURL)) == mBefore, "identical camera skips write")
+    }
+    check((try? Data(contentsOf: s1URL)) == s1Before && s1Before != nil, "camera save keeps stroke bytes")
+    MainActor.assumeIsolated {
+        let lib2 = CanvasLibrary(directory: dir, legacyURL: nil, autoCreateFirst: false)
+        let cam = Camera(center: CGPoint(x: 123.5, y: -456.25), scale: 2.5)
+        check(lib2.documents.first?.camera == cam, "camera restored after reload")
+    }
+    try? FileManager.default.removeItem(at: dir)
+} catch {
+    check(false, "camera persist threw \(error)")
 }
 
 if failures == 0 { print("ALL EDITING TESTS PASSED") }

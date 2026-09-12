@@ -2,6 +2,7 @@
 // 无限画布核心：相机状态 + 世界/屏幕坐标变换（纯数学，不依赖 UIKit，可单测）
 
 import CoreGraphics
+import Foundation
 
 /// 相机：定义“世界坐标系中哪一点落在视图中心，以及放大倍数”。
 ///
@@ -136,7 +137,7 @@ extension Camera: Codable {
         case x, y, scale
     }
 
-    init(from decoder: Decoder) throws {
+    nonisolated init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let x = try container.decode(CGFloat.self, forKey: .x)
         let y = try container.decode(CGFloat.self, forKey: .y)
@@ -144,7 +145,7 @@ extension Camera: Codable {
         self.init(center: CGPoint(x: x, y: y), scale: scale)
     }
 
-    func encode(to encoder: Encoder) throws {
+    nonisolated func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(center.x, forKey: .x)
         try container.encode(center.y, forKey: .y)

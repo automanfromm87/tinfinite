@@ -42,11 +42,13 @@ run_suite drawing \
 
 run_suite editing \
   "$ROOT/Tests/Suites/EditingSuite.swift" \
+  "$SRC/CanvasCore/Camera.swift" \
   "$SRC/Drawing/Strokes/StrokeModel.swift" \
   "$SRC/Drawing/Strokes/OneEuroFilter.swift" \
   "$SRC/Drawing/Strokes/StrokeSampler.swift" \
   "$SRC/Drawing/Strokes/StrokeGeometry.swift" \
   "$SRC/Drawing/Strokes/StrokeEditing.swift" \
+  "$SRC/Drawing/Strokes/StrokeSpatialGrid.swift" \
   "$SRC/Drawing/Strokes/StrokeStore.swift" \
   "$SRC/Content/ContentNode.swift" \
   "$SRC/Content/ContentStore.swift" \
