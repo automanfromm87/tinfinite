@@ -287,6 +287,35 @@ do {
     check(ordered == [.highlighter, .highlighter, .pen, .pencil], "highlighters first stable: \(ordered)")
 }
 
+// ---------- 12. 点按坍缩 ----------
+do {
+    // 相机在落笔/抬笔间挪动（惯性/双击缩放）：手指只抖 2px，
+    // 无坍缩会接受一个 500 世界单位外的终点，点按变直线
+    var s = StrokeSampler()
+    s.style = .pen(width: 8)
+    var camOffset: CGFloat = 0
+    s.worldConverter = { p in CGPoint(x: p.x + camOffset, y: p.y) }
+    s.begin(screen: CGPoint(x: 100, y: 100), pressure: 1, altitude: .pi / 2, azimuth: 0, time: 0)
+    camOffset = 500
+    s.end(screen: CGPoint(x: 102, y: 100), pressure: 1, altitude: .pi / 2, azimuth: 0, time: 0.1)
+    check(s.spine.count == 1, "tap collapses despite camera motion, got \(s.spine.count) points")
+    check(approx(s.spine.first!.center, CGPoint(x: 100, y: 100)), "tap keeps down point")
+    check(s.isTap, "isTap true")
+    // live 预览同样坍缩并压住预测尾巴
+    var live = StrokeSampler()
+    live.style = .pen(width: 8)
+    live.begin(screen: CGPoint(x: 50, y: 50), pressure: 1, altitude: .pi / 2, azimuth: 0, time: 0)
+    live.setPredicted([CGPoint(x: 900, y: 900)])
+    check(live.displaySpine.count == 1, "live tap suppresses predicted tail")
+    // 真线（超 slop）不受影响
+    var line = StrokeSampler()
+    line.style = .pen(width: 8)
+    line.begin(screen: CGPoint(x: 0, y: 0), pressure: 1, altitude: .pi / 2, azimuth: 0, time: 0)
+    line.append(screen: CGPoint(x: 30, y: 0), pressure: 1, altitude: .pi / 2, azimuth: 0, time: 0.01)
+    line.end(screen: CGPoint(x: 30, y: 0), pressure: 1, altitude: .pi / 2, azimuth: 0, time: 0.02)
+    check(!line.isTap && line.spine.count >= 2, "real line kept")
+}
+
 if failures == 0 { print("ALL DRAWING-MATH TESTS PASSED") }
 else { print("\(failures) FAILURES") }
 exit(failures == 0 ? 0 : 1)

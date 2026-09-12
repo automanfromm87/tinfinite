@@ -200,7 +200,10 @@ final class DrawingController: NSObject {
         guard let canvas else { return }
         switch recognizer.state {
         case .began:
-            guard let touch = recognizer.trackedTouch else { return }
+            // 按时间顺序起笔：从最早的 coalesced 点开始（tracked 是最新点，
+            // 先用它 begin 会在 spine 开头造一个“最新->略早”的回钩，快画时可见）。
+            // 点按路径（began 补发自 touchesEnded）coalesced 只有抬笔点，与 tracked 同一位置。
+            guard let touch = recognizer.pendingCoalesced.first ?? recognizer.trackedTouch else { return }
             beginEdit(with: touch, canvas: canvas)
             for t in recognizer.pendingCoalesced.dropFirst() {
                 appendEditTouch(t, canvas: canvas)

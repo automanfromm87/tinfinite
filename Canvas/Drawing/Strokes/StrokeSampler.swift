@@ -10,6 +10,9 @@ import Foundation
 nonisolated struct StrokeSampler {
     /// 屏幕重采样间距（点）。小于此距离的点并入，不进 spine。
     var spacingScreen: CGFloat = 2
+    /// 点按判据（屏幕点）：落笔到抬笔位移不足此值视为点按，spine 坍缩为落笔单点。
+    /// 防止抬笔前相机挪动（惯性/双击缩放）把静止手指映射成世界直线。
+    var tapSlop: CGFloat = 10
     /// 屏幕 -> 世界转换（DrawingController 注入，读当前 camera）
     var worldConverter: (CGPoint) -> CGPoint = { $0 }
     /// 当前笔样式（决定 spine 宽度）
@@ -19,6 +22,8 @@ nonisolated struct StrokeSampler {
     private var lastAcceptedScreen: CGPoint?
     private var lastPressure: CGFloat = 0.5
     private var lastAltitude: CGFloat = .pi / 2
+    private var downScreen: CGPoint?
+    private var maxScreenTravel: CGFloat = 0
     private var predictedScreen: [CGPoint] = []
 
     /// 原始输入点（世界，未滤波，用于 Stroke 存档/重建）
@@ -28,7 +33,9 @@ nonisolated struct StrokeSampler {
 
     /// 展示用 spine = 确认 spine + 预测尾巴（预测点用最后压力/倾斜算笔尖）。
     /// 预测点每事件刷新，只影响 live 预览，不进存档。
+    /// 点按中同样坍缩（并压住预测尾巴），live 与提交一致，无闪变。
     var displaySpine: [SpinePoint] {
+        if isTap, let first = spine.first { return [first] }
         guard !predictedScreen.isEmpty else { return spine }
         let nib = style.nib(pressure: lastPressure, altitude: lastAltitude)
         return spine + predictedScreen.map {
@@ -38,10 +45,14 @@ nonisolated struct StrokeSampler {
 
     // MARK: - 输入
 
+    /// 手指在屏幕上是否基本没动过（点按判据）
+    var isTap: Bool { maxScreenTravel < tapSlop }
+
     mutating func begin(screen: CGPoint, pressure: CGFloat, altitude: CGFloat, azimuth: CGFloat, time: TimeInterval) {
         reset()
         lastPressure = pressure
         lastAltitude = altitude
+        downScreen = screen
         let filtered = filter.filter(screen, at: time)
         pushRaw(screen: screen, pressure: pressure, altitude: altitude, azimuth: azimuth, time: time)
         accept(screen: filtered, pressure: pressure, altitude: altitude)
@@ -83,6 +94,11 @@ nonisolated struct StrokeSampler {
         } else {
             accept(screen: screen, pressure: pressure, altitude: altitude)
         }
+        // 点按坍缩：手指在屏幕上没动过 -> 落笔单点（无论相机动没动）。
+        // raw 点列保留原样（硬件实测存档）；spine 为空（未 begin 的误调）则不动。
+        if isTap, let first = spine.first {
+            spine = [first]
+        }
         predictedScreen = []
     }
 
@@ -91,6 +107,8 @@ nonisolated struct StrokeSampler {
         lastAcceptedScreen = nil
         lastPressure = 0.5
         lastAltitude = .pi / 2
+        downScreen = nil
+        maxScreenTravel = 0
         predictedScreen = []
         rawPoints = []
         spine = []
@@ -107,6 +125,9 @@ nonisolated struct StrokeSampler {
 
     private mutating func accept(screen: CGPoint, pressure: CGFloat, altitude: CGFloat) {
         lastAcceptedScreen = screen
+        if let down = downScreen {
+            maxScreenTravel = max(maxScreenTravel, hypot(screen.x - down.x, screen.y - down.y))
+        }
         let nib = style.nib(pressure: pressure, altitude: altitude)
         spine.append(SpinePoint(
             center: worldConverter(screen),
