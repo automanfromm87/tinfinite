@@ -12,7 +12,8 @@ run_suite() {
   # 顶层测试代码必须位于 main.swift：每套件独立目录
   mkdir -p "$TMP/$name"
   cp "$suite" "$TMP/$name/main.swift"
-  if swiftc -o "$TMP/$name/$name" "$TMP/$name/main.swift" "$@" 2>"$TMP/$name.err"; then
+  # -DDEBUG：打开单测专用钩子（如 StrokeStore.gridCountForTest），不影响 App 产物
+  if swiftc -DDEBUG -o "$TMP/$name/$name" "$TMP/$name/main.swift" "$@" 2>"$TMP/$name.err"; then
     if "$TMP/$name/$name"; then
       return 0
     else

@@ -1,10 +1,25 @@
 // StrokeSpatialGrid.swift
 // 笔画空间哈希网格（纯逻辑，可单测）：点选/橡皮/套索/可见集的候选过滤。
 // 只做候选集（精确判定仍由调用方的 spine 级测试完成），语义与暴力扫描完全一致。
-// 查询返回 nil 表示范围过大不值得过滤，调用方回退全量扫描（正确性优先）。
+// 查询返回 .all 表示范围过大不值得过滤，调用方回退全量扫描（正确性优先）。
 
 import CoreGraphics
 import Foundation
+
+/// 网格候选集：.all = 不过滤（范围过大/非法查询，调用方全量扫描）；
+/// .some = 只需检查这些 id（空集 = 谁都不用查）。
+/// 用枚举而不用 Optional<Set>：调用方无需在每次迭代中做 nil 检查。
+nonisolated enum Candidates: Sendable, Equatable {
+    case all
+    case some(Set<UUID>)
+
+    func contains(_ id: UUID) -> Bool {
+        switch self {
+        case .all: return true
+        case .some(let set): return set.contains(id)
+        }
+    }
+}
 
 nonisolated struct StrokeSpatialGrid: Sendable {
     /// 格边长（世界单位）：笔画 bounds 典型几十~几百，256 让大多数笔画落 1~4 格
@@ -57,8 +72,13 @@ nonisolated struct StrokeSpatialGrid: Sendable {
         overflow.remove(id)
     }
 
-    /// 移动后的 bounds 更新（占格不变时零操作）
+    /// 移动后的 bounds 更新（占格不变时零操作）。
+    /// 不在表里的 id 直接走 insert：防调用方漏插导致该笔永久不可命中。
     mutating func move(id: UUID, from old: CGRect, to new: CGRect) {
+        guard home[id] != nil || overflow.contains(id) else {
+            insert(id: id, bounds: new)
+            return
+        }
         let a = Self.spanCells(for: old, limit: Self.maxCellsPerStroke)
         let b = Self.spanCells(for: new, limit: Self.maxCellsPerStroke)
         if a == b, a != nil { return }
@@ -79,10 +99,10 @@ nonisolated struct StrokeSpatialGrid: Sendable {
         }
     }
 
-    /// 矩形相交的候选 id；nil = 范围过大，调用方回退全量扫描
-    func strokes(in rect: CGRect) -> Set<UUID>? {
+    /// 矩形相交的候选 id；范围过大返回 .all（调用方回退全量扫描）
+    func strokes(in rect: CGRect) -> Candidates {
         guard let covered = Self.spanCells(for: rect, limit: Self.maxCellsPerQuery) else {
-            return nil
+            return .all
         }
         var out = overflow
         for c in covered {
@@ -90,12 +110,12 @@ nonisolated struct StrokeSpatialGrid: Sendable {
                 out.formUnion(ids)
             }
         }
-        return out
+        return .some(out)
     }
 
-    /// 点邻域候选；nil = 回退全量扫描
-    func strokes(near point: CGPoint, radius: CGFloat) -> Set<UUID>? {
-        guard radius.isFinite, radius >= 0 else { return nil }
+    /// 点邻域候选；非法输入返回 .all（回退全量扫描）
+    func strokes(near point: CGPoint, radius: CGFloat) -> Candidates {
+        guard radius.isFinite, radius >= 0 else { return .all }
         return strokes(in: CGRect(
             x: point.x - radius, y: point.y - radius,
             width: radius * 2, height: radius * 2
@@ -105,11 +125,16 @@ nonisolated struct StrokeSpatialGrid: Sendable {
     // MARK: - 内部
 
     /// 矩形覆盖的格子；格数超限返回 nil（调用方决定 overflow/回退）。
-    /// 非法矩形（null/NaN/无限）返回空集：与 CGRect.intersects 的行为一致
+    /// 非法矩形（null/NaN/无限/超大坐标）返回空集：与 CGRect.intersects 的行为一致
     /// （非法矩形 intersect 恒为 false，暴力扫描同样跳过）。
+    /// 必须校验原点：NaN 原点的零尺寸矩形 isNull 为 false，会漏过 isNull 检查，
+    /// 直接进 Int(floor(NaN/256)) 触发运行时 trap。
     static func spanCells(for rect: CGRect, limit: Int) -> Set<CellID>? {
-        guard !rect.isNull, rect.width.isFinite, rect.height.isFinite,
-              rect.width >= 0, rect.height >= 0
+        guard !rect.isNull,
+              rect.minX.isFinite, rect.minY.isFinite,
+              rect.maxX.isFinite, rect.maxY.isFinite,
+              rect.width >= 0, rect.height >= 0,
+              max(max(abs(rect.minX), abs(rect.minY)), max(abs(rect.maxX), abs(rect.maxY))) < 1e15
         else { return [] }
         let x0 = Int(floor(rect.minX / cellSize))
         let x1 = Int(floor(rect.maxX / cellSize))

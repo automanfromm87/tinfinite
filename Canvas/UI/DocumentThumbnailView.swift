@@ -4,6 +4,30 @@
 
 import SwiftUI
 
+/// 异步缩略图：笔画后台懒加载（.task + @State），行内只渲染节点/占位，加载完刷新。
+/// 避免在 List 行 body 里同步解码几千笔（主线程 jank）或在构建中途发布。
+struct AsyncThumbnailView: View {
+    @ObservedObject var library: CanvasLibrary
+    var doc: CanvasDocument
+    var size = CGSize(width: 64, height: 48)
+
+    @State private var strokes: [Stroke]?
+
+    var body: some View {
+        DocumentThumbnailView(doc: resolvedDoc, size: size)
+            .task(id: doc.meta.id) {
+                strokes = await library.strokes(for: doc.meta.id)
+            }
+    }
+
+    private var resolvedDoc: CanvasDocument {
+        var d = doc
+        // 已加载文档直接用内存笔画（刚画完的行不等后台读）
+        d.strokes = doc.strokesLoaded ? doc.strokes : (strokes ?? [])
+        return d
+    }
+}
+
 struct DocumentThumbnailView: View {
     var doc: CanvasDocument
     var size = CGSize(width: 64, height: 48)

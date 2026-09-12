@@ -4,6 +4,7 @@
 //
 
 import SwiftUI
+import UIKit
 
 struct ContentView: View {
     @StateObject private var library = CanvasLibrary()
@@ -11,6 +12,7 @@ struct ContentView: View {
     @State private var columnVisibility = NavigationSplitViewVisibility.all
 
     @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         Group {
@@ -40,6 +42,16 @@ struct ContentView: View {
                 }
             }
         }
+        // 列表页切后台也排干存档队列（重命名等操作是异步落盘的）
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .background else { return }
+            let lib = library
+            Task { @MainActor in
+                let taskID = UIApplication.shared.beginBackgroundTask(withName: "canvas-flush") {}
+                await lib.flushSaves()
+                UIApplication.shared.endBackgroundTask(taskID)
+            }
+        }
         .onAppear {
             #if DEBUG
             if CommandLine.arguments.contains("-CanvasOpenFirst") {
@@ -55,7 +67,8 @@ struct ContentView: View {
 
     @ViewBuilder
     private func detailView(for id: UUID) -> some View {
-        if library.document(id: id) != nil {
+        // hasDocument 只看 manifest 壳：body 里绝不触发笔画懒加载（读盘 + 发布）
+        if library.hasDocument(id: id) {
             CanvasDetailView(
                 library: library,
                 documentID: id,

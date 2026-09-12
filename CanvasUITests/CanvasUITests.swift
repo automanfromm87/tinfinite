@@ -98,6 +98,54 @@ final class CanvasUITests: XCTestCase {
         XCTAssertNotEqual(readout("cameraReadout"), before, "pinch did not zoom")
     }
 
+    // MARK: - 相机持久化
+
+    /// 视角存档全链路：返回列表重进（内存/ disappear 路径）视角一致；
+    /// 按 Home（800ms 防抖窗口内，测后台 flush）-> 杀进程 -> 重进（磁盘路径）视角一致。
+    /// 依赖：测试按字母序串行，本测新建的文档是最新首位（-CanvasOpenFirst 打开它）。
+    func testCameraPersistsAcrossRelaunch() {
+        let detail = openFreshCanvas()
+        detail.doubleTap() // 独特视角：缩放 + 中心都变
+        sleep(2) // 手势收敛 + 读数同步
+        let zoomed = readout("cameraReadout")
+
+        // 返回列表再重进：disappear 立存 + 打开恢复
+        let back = app.buttons["返回列表"]
+        XCTAssertTrue(back.waitForExistence(timeout: 5))
+        back.tap()
+        let row = app.buttons["documentRow"]
+        XCTAssertTrue(row.firstMatch.waitForExistence(timeout: 5), "did not pop to list")
+        row.firstMatch.tap()
+        XCTAssertTrue(detail.waitForExistence(timeout: 10), "detail did not reopen")
+        sleep(1)
+        XCTAssertEqual(readout("cameraReadout"), zoomed, "camera not restored on reopen")
+
+        // 按 Home（防抖窗口内）-> 杀进程 -> 重进：后台 flush + 磁盘往返。
+        // 小慢拖拽：无惯性，触摸结束即终态（读数稳定）；读完立即 Home，
+        // 落在 800ms 防抖窗内，逼后台 flush 走 flushAutosave + 排干路径。
+        // 即使模拟器慢导致 Home 落在窗外，测试依然通过（只是不够锋利）。
+        let start = detail.coordinate(withNormalizedOffset: CGVector(dx: 0.35, dy: 0.4))
+        let end = detail.coordinate(withNormalizedOffset: CGVector(dx: 0.45, dy: 0.5))
+        start.press(forDuration: 0.2, thenDragTo: end)
+        // 等读数稳定（两次一致即终态），耗时 < 800ms，仍在防抖窗内按 Home
+        var panned = readout("cameraReadout")
+        for _ in 0..<3 {
+            usleep(200_000)
+            let now = readout("cameraReadout")
+            if now == panned { break }
+            panned = now
+        }
+        XCTAssertNotEqual(panned, zoomed, "pan did not move camera")
+        XCUIDevice.shared.press(.home)
+        sleep(3) // 后台任务落盘
+        app.terminate()
+        app.launchArguments = ["-CanvasOpenFirst"]
+        app.launch()
+        XCTAssertTrue(detail.waitForExistence(timeout: 15), "detail did not reopen after relaunch")
+        sleep(1)
+        XCTAssertEqual(readout("cameraReadout"), panned, "camera not persisted across relaunch")
+    }
+
     // MARK: - 绘画
 
     /// 落笔 -> 笔画计数 1、垃圾桶可用；撤销 -> 计数 0

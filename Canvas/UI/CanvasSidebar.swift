@@ -32,7 +32,7 @@ struct CanvasSidebar: View {
                             selection = doc.meta.id
                         } label: {
                             HStack(spacing: 10) {
-                                DocumentThumbnailView(doc: doc)
+                                AsyncThumbnailView(library: library, doc: doc)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(doc.meta.title)
                                         .font(.headline)
@@ -97,12 +97,14 @@ struct CanvasSidebar: View {
     }
 
     private func subtitle(for doc: CanvasDocument) -> String {
-        "\(doc.meta.updatedAt.formatted(date: .numeric, time: .shortened)) · \(doc.strokes.count) 笔 · \(doc.nodes.count) 节点"
+        "\(doc.meta.updatedAt.formatted(date: .numeric, time: .shortened)) · \(library.strokeCount(id: doc.meta.id)) 笔 · \(doc.nodes.count) 节点"
     }
 
     /// 导出 PNG 到临时文件（菜单打开时才生成一次；空文档返回 nil，不显示入口）
     private func pngExportURL(for doc: CanvasDocument) -> URL? {
-        guard let data = DocumentExporter.pngData(for: doc, imageData: { library.imageData(file: $0) })
+        // resolve 经缓存/读盘取全量笔画（菜单 action 上下文，非 body，同步读安全）
+        guard let full = library.document(id: doc.meta.id),
+              let data = DocumentExporter.pngData(for: full, imageData: { library.imageData(file: $0) })
         else { return nil }
         let safeTitle = doc.meta.title.replacingOccurrences(of: "/", with: "-")
         let url = FileManager.default.temporaryDirectory

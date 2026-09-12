@@ -752,12 +752,21 @@ final class DrawingController: NSObject {
 
     private func scheduleAutosave() {
         saveWork?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, let id = self.documentID else { return }
-            self.saveHandler?(id, self.store.strokes, self.content.nodes)
-        }
+        let work = DispatchWorkItem { [weak self] in self?.fireAutosave() }
         saveWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+    }
+
+    /// 立刻执行待定的自动存档（切后台时调，不等 500ms 防抖）
+    func flushAutosave() {
+        saveWork?.cancel()
+        saveWork = nil
+        fireAutosave()
+    }
+
+    private func fireAutosave() {
+        guard let id = documentID else { return }
+        saveHandler?(id, store.strokes, content.nodes)
     }
 
     // MARK: - 触摸属性

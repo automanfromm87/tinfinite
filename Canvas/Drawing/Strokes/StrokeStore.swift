@@ -136,7 +136,7 @@ nonisolated struct StrokeStore: Sendable {
         let candidates = eraseCandidates(path: path, radius: radius)
         var hitIndices: [Int] = []
         for (i, s) in strokes.enumerated() {
-            guard candidates == nil || candidates!.contains(s.id) else { continue }
+            guard candidates.contains(s.id) else { continue }
             if EraserHitTest.strokeHit(spine: s.spine, path: path, eraserRadius: radius) {
                 hitIndices.append(i)
             }
@@ -163,7 +163,7 @@ nonisolated struct StrokeStore: Sendable {
         // 从后往前，保证 index 有效；undo 时按原升序恢复
         for i in strokes.indices.reversed() {
             let s = strokes[i]
-            guard candidates == nil || candidates!.contains(s.id) else { continue }
+            guard candidates.contains(s.id) else { continue }
             let runs = EraserHitTest.eraseRuns(spine: s.spine, path: path, eraserRadius: radius)
             if runs.count == 1 && runs[0].count == s.spine.count { continue }
             grid.remove(id: s.id)
@@ -222,8 +222,8 @@ nonisolated struct StrokeStore: Sendable {
             let loopBounds = Self.boundingBox(of: loop)
             let candidates = grid.strokes(in: loopBounds)
             for s in strokes {
-                guard candidates == nil || candidates!.contains(s.id) else { continue }
-                guard s.bounds.intersects(loopBounds) else { continue }
+                // 便宜的 bbox 复核在前，Set 查找在后
+                guard s.bounds.intersects(loopBounds), candidates.contains(s.id) else { continue }
                 if LassoHitTest.strokeIntersectsLoop(spine: s.spine, loop: loop) {
                     result.insert(s.id)
                 }
@@ -238,7 +238,7 @@ nonisolated struct StrokeStore: Sendable {
         var result = Set<UUID>()
         let candidates = grid.strokes(near: worldPoint, radius: radius)
         for s in strokes.reversed() {
-            guard candidates == nil || candidates!.contains(s.id) else { continue }
+            guard candidates.contains(s.id) else { continue }
             if LassoHitTest.tapHit(spine: s.spine, point: worldPoint, radius: radius) {
                 result = [s.id]
                 break
@@ -249,12 +249,16 @@ nonisolated struct StrokeStore: Sendable {
     }
 
     /// 矩形相交的笔画 id（数组顺序 = z 序；网格候选 + 精确 bbox 复核）。
-    /// LOD 可见集等调用方用；nil 回退时与暴力扫描结果一致。
+    /// LOD 可见集等调用方用；.all 回退时与暴力扫描结果一致。
+    /// 注意：仍是 O(n) 全数组扫描（缺 id->下标索引），网格只省掉 bbox 比较，
+    /// 判据把便宜的 intersects 放前面；真收益在 tap/erase（省 spine 级测试）。
     func strokeIDs(in rect: CGRect) -> [UUID] {
-        guard let candidates = grid.strokes(in: rect) else {
+        switch grid.strokes(in: rect) {
+        case .all:
             return strokes.filter { $0.bounds.intersects(rect) }.map(\.id)
+        case .some(let candidates):
+            return strokes.filter { $0.bounds.intersects(rect) && candidates.contains($0.id) }.map(\.id)
         }
-        return strokes.filter { candidates.contains($0.id) && $0.bounds.intersects(rect) }.map(\.id)
     }
 
     mutating func clearSelection() {
@@ -533,10 +537,10 @@ nonisolated struct StrokeStore: Sendable {
         return rect
     }
 
-    /// 橡皮路径候选集（路径 bbox 外扩半径；nil = 回退全量扫描）
-    private func eraseCandidates(path: [CGPoint], radius: CGFloat) -> Set<UUID>? {
+    /// 橡皮路径候选集（路径 bbox 外扩半径；.all = 回退全量扫描）
+    private func eraseCandidates(path: [CGPoint], radius: CGFloat) -> Candidates {
         let box = Self.boundingBox(of: path)
-        guard !box.isNull, radius.isFinite, radius >= 0 else { return nil }
+        guard !box.isNull, radius.isFinite, radius >= 0 else { return .all }
         return grid.strokes(in: box.insetBy(dx: -radius, dy: -radius))
     }
 

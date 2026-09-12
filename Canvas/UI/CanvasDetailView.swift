@@ -2,6 +2,7 @@
 // 画布详情：全屏画布 + 顶部迷你栏（返回/侧边栏 + 标题）+ 右下角悬浮工具栏。
 
 import SwiftUI
+import UIKit
 
 struct CanvasDetailView: View {
     @ObservedObject var library: CanvasLibrary
@@ -10,6 +11,7 @@ struct CanvasDetailView: View {
     @Binding var selection: UUID?
 
     @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.scenePhase) private var scenePhase
 
     @StateObject private var model = InfiniteCanvasModel()
     @StateObject private var drawing = DrawingSettings()
@@ -23,11 +25,12 @@ struct CanvasDetailView: View {
     @State private var cameraSaveTask: Task<Void, Never>?
 
     private var title: String {
-        library.document(id: documentID)?.meta.title ?? ""
+        library.meta(id: documentID)?.title ?? ""
     }
 
     /// 相机防抖存档：手势中 camera 高频变化，每次取消重约，只在静止 800ms 后落盘一次。
-    /// updateCamera 内部对未变内容是 O(n) 指针级比较 + 只重写 manifest 小文件。
+    /// updateCamera 先做 O(1) 相等短路；真变了才进 save() 做 O(n) diff，
+    /// 内容未变时后台只重写 manifest 小文件。
     @MainActor
     private func persistCameraDebounced() {
         cameraSaveTask?.cancel()
@@ -226,11 +229,26 @@ struct CanvasDetailView: View {
             cameraSaveTask?.cancel()
             library.updateCamera(id: documentID, camera: model.camera)
         }
+        // 切后台：先立刻触发待定的笔画/相机存档（不等防抖），再等后台队列排干。
+        // beginBackgroundTask 保证 suspend 前写完，否则最后一笔可能丢失。
+        // 过期 handler 留空：过期等价于崩溃，manifest-last 提交顺序已保证一致性。
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .background else { return }
+            cameraSaveTask?.cancel()
+            refs.controller?.flushAutosave()
+            library.updateCamera(id: documentID, camera: model.camera)
+            let lib = library
+            Task { @MainActor in
+                let taskID = UIApplication.shared.beginBackgroundTask(withName: "canvas-flush") {}
+                await lib.flushSaves()
+                UIApplication.shared.endBackgroundTask(taskID)
+            }
+        }
         .onAppear {
             // 恢复上次离开时的视角（只做一次；animated:false 不依赖 viewport 尺寸）
             if !cameraRestored {
                 cameraRestored = true
-                if let saved = library.document(id: documentID)?.camera {
+                if let saved = library.camera(id: documentID) {
                     model.setCamera(saved, animated: false)
                 }
             }
