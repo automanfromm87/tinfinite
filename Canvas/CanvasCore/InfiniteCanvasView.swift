@@ -58,6 +58,12 @@ final class InfiniteCanvasView: UIView {
     private let panRecognizer = UIPanGestureRecognizer()
     private let pinchRecognizer = UIPinchGestureRecognizer()
     private let doubleTapRecognizer = UITapGestureRecognizer()
+    private let undoTapRecognizer = UITapGestureRecognizer()
+    private let redoTapRecognizer = UITapGestureRecognizer()
+
+    /// 撤销/重做手势开关（落笔过程中由 DrawingController 关掉，
+    /// 避免第二根手指点按在 live 笔画中途触发 undo）
+    var isUndoGestureEnabled = true
 
     /// 点按跟踪（touch-up 即时确认点选，不经过 UITapGestureRecognizer 的双击等待）
     private var tapDownPoint: CGPoint?
@@ -110,6 +116,20 @@ final class InfiniteCanvasView: UIView {
         doubleTapRecognizer.delegate = self
         doubleTapRecognizer.addTarget(self, action: #selector(handleDoubleTap(_:)))
         addGestureRecognizer(doubleTapRecognizer)
+
+        // 双指点按撤销 / 三指点按重做（Procreate 同款手势）。
+        // 与 pan/pinch 天然互斥：点按无位移，pan/pinch 不会 began；手指一动 tap 即失败。
+        undoTapRecognizer.numberOfTouchesRequired = 2
+        undoTapRecognizer.delegate = self
+        undoTapRecognizer.addTarget(self, action: #selector(handleUndoTap(_:)))
+        addGestureRecognizer(undoTapRecognizer)
+
+        redoTapRecognizer.numberOfTouchesRequired = 3
+        redoTapRecognizer.delegate = self
+        redoTapRecognizer.addTarget(self, action: #selector(handleRedoTap(_:)))
+        addGestureRecognizer(redoTapRecognizer)
+
+        // pinch 与点按的竞速见下方 shouldBeRequiredToFailBy（动态裁决）
 
         applyTransform()
     }
@@ -251,6 +271,16 @@ final class InfiniteCanvasView: UIView {
         default:
             break
         }
+    }
+
+    @objc private func handleUndoTap(_ recognizer: UITapGestureRecognizer) {
+        guard isUndoGestureEnabled else { return }
+        onKeyAction?(.undo)
+    }
+
+    @objc private func handleRedoTap(_ recognizer: UITapGestureRecognizer) {
+        guard isUndoGestureEnabled else { return }
+        onKeyAction?(.redo)
     }
 
     @objc private func handleDoubleTap(_ recognizer: UITapGestureRecognizer) {
@@ -484,11 +514,31 @@ extension InfiniteCanvasView: UIGestureRecognizerDelegate {
         return ours.contains(gestureRecognizer) && ours.contains(otherGestureRecognizer)
     }
 
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldBeRequiredToFailBy otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        // pinch 在第二指落下即 began，会抢先置 fail 掉点按手势，所以 pinch
+        // 必须等点按先判。但不能静态 require（双指 pinch 时三指点按永远
+        // Possible，会把 pinch 卡到抬手），按当前触摸数动态裁决：
+        // - 2 指：等双指撤销点按（手指一动它即失败，pinch 几乎无延迟）
+        // - 3 指：等三指重做点按（双指点按在第三指落下时已因超数自败）
+        // pan 靠位移 began，不抢点按，无需排序。
+        guard gestureRecognizer === pinchRecognizer else { return false }
+        let touches = pinchRecognizer.numberOfTouches
+        if otherGestureRecognizer === undoTapRecognizer { return touches == 2 }
+        if otherGestureRecognizer === redoTapRecognizer { return touches >= 3 }
+        return false
+    }
+
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
-        // 落在内容节点上的触摸：pan/双击让路（节点自己的 tap/pan 接管选中与拖拽）。
+        // 落在内容节点上的触摸：pan/双击/撤销点按让路（节点自己的 tap/pan 接管选中与拖拽，
+        // 文本框走系统键盘撤销，不抢）。
         // 节点只在 navigate 模式可交互（draw 模式 isUserInteractionEnabled=false，
         // 命中测试直接跳过，触摸照常落到画布上）。
-        if gestureRecognizer === panRecognizer || gestureRecognizer === doubleTapRecognizer {
+        if gestureRecognizer === panRecognizer || gestureRecognizer === doubleTapRecognizer
+            || gestureRecognizer === undoTapRecognizer || gestureRecognizer === redoTapRecognizer
+        {
             var view: UIView? = touch.view
             while let current = view {
                 if current is ContentNodeView { return false }

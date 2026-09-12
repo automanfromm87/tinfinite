@@ -81,6 +81,42 @@ final class DrawingSettings: ObservableObject {
     /// 快捷配色
     let palette: [RGBA] = [.black, .red, .orange, .green, .blue, .purple]
 
+    /// 常用色（色轮自选，UserDefaults 跨文档持久化，最多 8 个）
+    @Published private(set) var recentColors: [RGBA] = DrawingSettings.loadRecents()
+    private static let recentsKey = "canvas.recentColors"
+    private static let maxRecents = 8
+
+    /// 色轮关闭时调：自定义色记入常用（已在快捷/常用里的不重复记）
+    func commitCustomColor(_ color: RGBA) {
+        var rgb = color
+        rgb.a = 1 // 常用色只记 RGB（透明度由笔刷定）
+        guard !palette.contains(rgb), !recentColors.contains(rgb) else { return }
+        recentColors.insert(rgb, at: 0)
+        if recentColors.count > Self.maxRecents {
+            recentColors.removeLast(recentColors.count - Self.maxRecents)
+        }
+        let flat = recentColors.flatMap { [$0.r, $0.g, $0.b] }
+        UserDefaults.standard.set(flat, forKey: Self.recentsKey)
+    }
+
+    private static func loadRecents() -> [RGBA] {
+        #if DEBUG
+        if CommandLine.arguments.contains("-CanvasResetRecents") {
+            UserDefaults.standard.removeObject(forKey: recentsKey)
+            return []
+        }
+        #endif
+        // NSNumber 逐个转（UserDefaults 存的是 NSNumber，直接 as [Float] 不可靠）
+        guard let raw = UserDefaults.standard.array(forKey: recentsKey) as? [NSNumber] else { return [] }
+        var out: [RGBA] = []
+        for i in stride(from: 0, to: raw.count, by: 3) {
+            guard i + 2 < raw.count else { break }
+            out.append(RGBA(r: raw[i].floatValue, g: raw[i + 1].floatValue, b: raw[i + 2].floatValue, a: 1))
+            if out.count >= maxRecents { break }
+        }
+        return out
+    }
+
     func attach(_ controller: DrawingController) {
         self.controller = controller
         controller.mode = mode

@@ -373,8 +373,14 @@ nonisolated struct StrokeStore: Sendable {
 
     // MARK: - Undo 引擎
 
+    /// 撤销栈上限（无界增长会吃掉长会话内存；超限丢弃最旧的一步）
+    static let maxUndoDepth = 100
+
     private mutating func pushUndo(_ entry: UndoEntry) {
         undoStack.append(entry)
+        if undoStack.count > Self.maxUndoDepth {
+            undoStack.removeFirst(undoStack.count - Self.maxUndoDepth)
+        }
         redoStack.removeAll()
     }
 

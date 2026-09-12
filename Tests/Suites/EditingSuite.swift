@@ -1092,6 +1092,52 @@ do {
     check(false, "versions threw \(error)")
 }
 
+// ---------- 撤销栈上限（笔画/节点各 100 步，超限丢最旧） ----------
+
+do {
+    var store = StrokeStore()
+    for i in 0..<(StrokeStore.maxUndoDepth + 5) {
+        addLine(&store, x0: 0, x1: 10, y: CGFloat(i), n: 3)
+    }
+    check(store.undoDepth == StrokeStore.maxUndoDepth, "stroke undo capped at \(StrokeStore.maxUndoDepth)")
+    var undos = 0
+    while store.undo() != nil { undos += 1 }
+    check(undos == StrokeStore.maxUndoDepth, "exactly cap undos available, got \(undos)")
+    check(store.strokes.count == 5, "oldest 5 dropped beyond undo, kept \(store.strokes.count)")
+}
+
+do {
+    var content = ContentStore()
+    for i in 0..<(ContentStore.maxUndoDepth + 5) {
+        content.add(ContentNode(kind: .shape(.rectangle), frame: CGRect(x: CGFloat(i), y: 0, width: 10, height: 10)))
+    }
+    check(content.undoDepth == ContentStore.maxUndoDepth, "content undo capped at \(ContentStore.maxUndoDepth)")
+    var undos = 0
+    while content.undo() != nil { undos += 1 }
+    check(undos == ContentStore.maxUndoDepth, "exactly cap content undos, got \(undos)")
+    check(content.nodes.count == 5, "oldest 5 content nodes dropped, kept \(content.nodes.count)")
+}
+
+// ---------- 手掌判定 ----------
+
+do {
+    check(!PalmRejection.isLikelyPalm(majorRadius: 10, isDirectTouch: true), "finger not palm")
+    check(!PalmRejection.isLikelyPalm(majorRadius: 25.9, isDirectTouch: true), "just under threshold")
+    check(PalmRejection.isLikelyPalm(majorRadius: 26, isDirectTouch: true), "at threshold is palm")
+    check(PalmRejection.isLikelyPalm(majorRadius: 40, isDirectTouch: true), "palm resting")
+    check(!PalmRejection.isLikelyPalm(majorRadius: 40, isDirectTouch: false), "pencil/mouse never palm")
+    check(!PalmRejection.isLikelyPalm(majorRadius: 0, isDirectTouch: true), "unknown radius not palm")
+    check(!PalmRejection.isLikelyPalm(majorRadius: .infinity, isDirectTouch: true), "inf radius not palm")
+}
+
+// ---------- 纸张/网格 ----------
+
+do {
+    check(PaperTheme.black.isDark && !PaperTheme.white.isDark && !PaperTheme.system.isDark, "paper dark flags")
+    check(GridStyle.lines.showsGrid && GridStyle.dots.showsGrid && !GridStyle.off.showsGrid, "grid visibility")
+    check(PaperTheme(rawValue: "black") == .black && GridStyle(rawValue: "dots") == .dots, "rawvalue roundtrip")
+}
+
 if failures == 0 { print("ALL EDITING TESTS PASSED") }
 else { print("\(failures) FAILURES") }
 exit(failures == 0 ? 0 : 1)

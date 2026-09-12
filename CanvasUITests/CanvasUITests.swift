@@ -61,6 +61,43 @@ final class CanvasUITests: XCTestCase {
         XCTAssertNotEqual(before, after, "slider drag had no effect")
     }
 
+    /// 色轮：弹窗出现 -> 拉满明度 -> 轮上拾色 -> 关闭落入常用色
+    func testColorWheelPresentsAndPicks() {
+        // 干净启动（清常用色，保证断言确定）
+        app.terminate()
+        app.launchArguments = ["-CanvasResetRecents"]
+        app.launch()
+        openFreshCanvas()
+        expandToolbar()
+        let pen = app.buttons["paintbrush.pointed.fill"]
+        XCTAssertTrue(pen.waitForExistence(timeout: 5))
+        pen.tap()
+        let wheelButton = app.buttons["colorWheelButton"]
+        XCTAssertTrue(wheelButton.waitForExistence(timeout: 5))
+        wheelButton.tap()
+        let wheel = app.descendants(matching: .any)["colorWheel"]
+        XCTAssertTrue(wheel.waitForExistence(timeout: 5), "color wheel did not present")
+        // 先拉满明度（默认黑起手，v=0 时轮上任何位置都是黑）
+        let valueBar = app.descendants(matching: .any)["valueBar"]
+        XCTAssertTrue(valueBar.waitForExistence(timeout: 5))
+        let vStart = valueBar.coordinate(withNormalizedOffset: CGVector(dx: 0.1, dy: 0.5))
+        let vEnd = valueBar.coordinate(withNormalizedOffset: CGVector(dx: 0.98, dy: 0.5))
+        vStart.press(forDuration: 0.1, thenDragTo: vEnd)
+        // 轮上沿从顶部（红）拖到右侧：拾色不断言具体值（坐标->色相映射由单测覆盖）
+        let start = wheel.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.02))
+        let end = wheel.coordinate(withNormalizedOffset: CGVector(dx: 0.98, dy: 0.5))
+        start.press(forDuration: 0.1, thenDragTo: end)
+        sleep(1)
+        app.buttons["完成"].tap()
+        sleep(1)
+        XCTAssertFalse(wheel.exists, "color wheel did not dismiss")
+        // 自选彩色落入常用（黑/快捷色不记；此处必为高饱和彩色）
+        let recents = app.buttons.matching(identifier: "recentSwatch")
+        XCTAssertEqual(recents.count, 1, "custom color not committed to recents")
+        recents.firstMatch.tap() // 应用常用色（冒烟，不断言）
+        sleep(1)
+    }
+
     // MARK: - 导航
 
     func testBackToList() {
@@ -174,6 +211,82 @@ final class CanvasUITests: XCTestCase {
         app.buttons["arrow.uturn.backward"].tap()
         expectation(for: NSPredicate(format: "label CONTAINS 'strokes 0'"), evaluatedWith: content)
         waitForExpectations(timeout: 5)
+    }
+
+    // MARK: - 速调条 / 撤销手势 / 纸张
+
+    /// 收起态速调条：绘画模式可见可调，导航模式隐藏
+    func testQuickWidthStrip() {
+        let detail = openFreshCanvas()
+        expandToolbar()
+        let pen = app.buttons["paintbrush.pointed.fill"]
+        XCTAssertTrue(pen.waitForExistence(timeout: 5))
+        pen.tap()
+        collapseToolbar()
+        let quick = app.sliders["quickWidthSlider"]
+        XCTAssertTrue(quick.waitForExistence(timeout: 5), "quick strip missing in draw mode")
+        let value = app.descendants(matching: .any)["quickWidthValue"]
+        XCTAssertTrue(value.waitForExistence(timeout: 5))
+        let before = value.label
+        quick.adjust(toNormalizedSliderPosition: 0.9)
+        sleep(1)
+        XCTAssertNotEqual(value.label, before, "quick slider had no effect")
+        // 切回导航模式：速调条消失
+        XCTAssertTrue(detail.waitForExistence(timeout: 5))
+        expandToolbar()
+        app.buttons["hand.draw.fill"].tap()
+        collapseToolbar()
+        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: quick)
+        waitForExpectations(timeout: 5)
+    }
+
+    /// 双指点按撤销：落笔一画 -> 双指点按 -> 笔画计数归零
+    func testTwoFingerTapUndo() {
+        let detail = openFreshCanvas()
+        expandToolbar()
+        let pen = app.buttons["paintbrush.pointed.fill"]
+        XCTAssertTrue(pen.waitForExistence(timeout: 5))
+        pen.tap()
+        collapseToolbar()
+        let start = detail.coordinate(withNormalizedOffset: CGVector(dx: 0.25, dy: 0.35))
+        let end = detail.coordinate(withNormalizedOffset: CGVector(dx: 0.65, dy: 0.45))
+        start.press(forDuration: 0, thenDragTo: end)
+        let content = app.descendants(matching: .any)["contentReadout"]
+        XCTAssertTrue(content.waitForExistence(timeout: 5))
+        expectation(for: NSPredicate(format: "label CONTAINS 'strokes 1'"), evaluatedWith: content)
+        waitForExpectations(timeout: 5)
+        sleep(2) // 落笔提交 + 速调条动画收敛后再双指点按
+        // twoFingerTap 在全屏元素上算不出坐标（XCUITest 限制），用近似 1 的
+        // pinch 做机械等价的两指按下-抬起（位移 ~1pt < 点按 10pt 容差，照样触发）
+        detail.pinch(withScale: 1.02, velocity: 1)
+        expectation(for: NSPredicate(format: "label CONTAINS 'strokes 0'"), evaluatedWith: content)
+        waitForExpectations(timeout: 5)
+    }
+
+    /// 纸张/网格选项：按钮存在可点（视觉由截图验证）
+    func testPaperAndGridOptions() {
+        openFreshCanvas()
+        expandToolbar()
+        // 纸张/网格在面板底部：滚到底再点（小屏下面板滚动）
+        let panel = app.scrollViews["toolPanel"]
+        XCTAssertTrue(panel.waitForExistence(timeout: 5), "missing tool panel")
+        panel.swipeUp()
+        sleep(1)
+        for id in ["paperSystem", "paperWhite", "paperBlack"] {
+            let btn = app.buttons[id]
+            XCTAssertTrue(btn.waitForExistence(timeout: 5), "missing \(id)")
+            btn.tap()
+        }
+        let grid = app.segmentedControls["gridStylePicker"]
+        XCTAssertTrue(grid.waitForExistence(timeout: 5), "missing grid style picker")
+        for label in ["线格", "点阵", "关"] {
+            grid.buttons[label].tap()
+            sleep(1)
+        }
+        // 回到默认：系统纸 + 线格（不污染后续测试截图）
+        app.buttons["paperSystem"].tap()
+        grid.buttons["线格"].tap()
+        sleep(1)
     }
 
     // MARK: - 内容节点

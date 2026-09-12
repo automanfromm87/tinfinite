@@ -147,8 +147,14 @@ nonisolated struct ContentStore: Sendable {
 
     // MARK: - 内部
 
+    /// 撤销栈上限（与 StrokeStore 对齐，超限丢弃最旧的一步）
+    static let maxUndoDepth = 100
+
     private mutating func pushUndo(_ entry: ContentUndoEntry) {
         undoStack.append(entry)
+        if undoStack.count > Self.maxUndoDepth {
+            undoStack.removeFirst(undoStack.count - Self.maxUndoDepth)
+        }
         redoStack.removeAll()
     }
 

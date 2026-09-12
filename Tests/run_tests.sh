@@ -44,6 +44,7 @@ run_suite drawing \
 run_suite editing \
   "$ROOT/Tests/Suites/EditingSuite.swift" \
   "$SRC/CanvasCore/Camera.swift" \
+  "$SRC/CanvasCore/PaperTheme.swift" \
   "$SRC/Drawing/Strokes/StrokeModel.swift" \
   "$SRC/Drawing/Strokes/OneEuroFilter.swift" \
   "$SRC/Drawing/Strokes/StrokeSampler.swift" \
@@ -51,6 +52,7 @@ run_suite editing \
   "$SRC/Drawing/Strokes/StrokeEditing.swift" \
   "$SRC/Drawing/Strokes/StrokeSpatialGrid.swift" \
   "$SRC/Drawing/Strokes/StrokeStore.swift" \
+  "$SRC/Drawing/Input/PalmRejection.swift" \
   "$SRC/Content/ContentNode.swift" \
   "$SRC/Content/ContentStore.swift" \
   "$SRC/UI/MinimapMath.swift" \

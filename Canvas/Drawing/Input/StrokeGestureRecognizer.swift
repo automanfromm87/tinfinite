@@ -38,7 +38,7 @@ final class StrokeGestureRecognizer: UIGestureRecognizer {
             state = .failed
             return
         }
-        guard let touch = touches.first(where: isTouchAllowed) else {
+        guard let touch = touches.first(where: { isTouchAllowed($0) && !isPalm($0) }) else {
             // 没有允许类型的触摸：这次序列与我无关（保持 possible，让别人识别）
             return
         }
@@ -112,11 +112,18 @@ final class StrokeGestureRecognizer: UIGestureRecognizer {
         return allowedTouchTypes.contains(NSNumber(value: touch.type.rawValue))
     }
 
-    /// 当前序列中存活的允许类型触摸（began/moved/stationary，不含已结束的）
+    /// 当前序列中存活的允许类型触摸（began/moved/stationary，不含已结束的；
+    /// 手掌不计入：笔模式下手指 rests 本来就不计数，这里连手指模式的手掌也不计数）
     private func liveAllowedTouches(_ event: UIEvent?) -> [UITouch] {
         (event?.allTouches ?? []).filter {
-            isTouchAllowed($0) && ($0.phase == .began || $0.phase == .moved || $0.phase == .stationary)
+            isTouchAllowed($0) && !isPalm($0)
+                && ($0.phase == .began || $0.phase == .moved || $0.phase == .stationary)
         }
+    }
+
+    /// 手掌 resting 判定（大面积 direct 触摸；判据见 PalmRejection 单测）
+    private func isPalm(_ touch: UITouch) -> Bool {
+        PalmRejection.isLikelyPalm(majorRadius: touch.majorRadius, isDirectTouch: touch.type == .direct)
     }
 
     private func coalesced(for touch: UITouch, event: UIEvent) -> [UITouch] {

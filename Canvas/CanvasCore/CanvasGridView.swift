@@ -19,6 +19,26 @@ final class CanvasGridView: UIView {
     var majorLineColor: UIColor = .secondarySystemFill
     var axisColor: UIColor = .systemBlue.withAlphaComponent(0.5)
 
+    /// 深底时的线色（黑纸用；浅底走上面的默认色）
+    var darkMinorLineColor: UIColor = UIColor(white: 1, alpha: 0.10)
+    var darkMajorLineColor: UIColor = UIColor(white: 1, alpha: 0.20)
+
+    /// 网格样式（线 / 点阵；off 时上层直接 hidden，本视图不处理）
+    var style: GridStyle = .lines {
+        didSet {
+            guard style != oldValue else { return }
+            setNeedsDisplay()
+        }
+    }
+
+    /// 是否深底（黑纸/深色模式，线色翻转保证可见）
+    var darkBackground: Bool = false {
+        didSet {
+            guard darkBackground != oldValue else { return }
+            setNeedsDisplay()
+        }
+    }
+
     /// 每 N 格画一条主线
     var majorEvery: Int = 5
 
@@ -54,17 +74,28 @@ final class CanvasGridView: UIView {
         let step = niceStep(rawStep)
         let majorStep = step * CGFloat(majorEvery)
 
-        ctx.setLineWidth(1.0 / contentScaleFactor)
+        let minor = darkBackground ? darkMinorLineColor : minorLineColor
+        let major = darkBackground ? darkMajorLineColor : majorLineColor
 
-        // 只遍历可见范围内的格线
-        drawLines(
-            ctx: ctx, viewport: vp, visible: visible, step: step,
-            color: minorLineColor, skipMultipleOf: majorEvery
-        )
-        drawLines(
-            ctx: ctx, viewport: vp, visible: visible, step: majorStep,
-            color: majorLineColor, skipMultipleOf: 0
-        )
+        if style == .dots {
+            // 点阵纸：只在格点画圆点（小点=次线格点，大点=主线格点）
+            drawDots(
+                ctx: ctx, viewport: vp, visible: visible, step: step,
+                minorColor: minor, majorColor: major
+            )
+        } else {
+            ctx.setLineWidth(1.0 / contentScaleFactor)
+
+            // 只遍历可见范围内的格线
+            drawLines(
+                ctx: ctx, viewport: vp, visible: visible, step: step,
+                color: minor, skipMultipleOf: majorEvery
+            )
+            drawLines(
+                ctx: ctx, viewport: vp, visible: visible, step: majorStep,
+                color: major, skipMultipleOf: 0
+            )
+        }
         drawAxes(ctx: ctx, viewport: vp, visible: visible)
     }
 
@@ -110,6 +141,54 @@ final class CanvasGridView: UIView {
             ctx.addLine(to: CGPoint(x: bounds.maxX, y: sy))
         }
         ctx.strokePath()
+    }
+
+    /// 点阵：可见格点画圆点（主线格点更大；与 drawLines 同一遍历预算）
+    private func drawDots(
+        ctx: CGContext,
+        viewport vp: Viewport,
+        visible: CGRect,
+        step: CGFloat,
+        minorColor: UIColor,
+        majorColor: UIColor
+    ) {
+        guard step > 0, step.isFinite else { return }
+        var kMin = Int(floor(visible.minX / step))
+        var kMax = Int(ceil(visible.maxX / step))
+        var jMin = Int(floor(visible.minY / step))
+        var jMax = Int(ceil(visible.maxY / step))
+        // 点数是线数的平方级：预算收紧到 400x400（屏外本来也画不下）
+        if kMax - kMin > 400 {
+            let mid = (kMin + kMax) / 2
+            kMin = mid - 200
+            kMax = mid + 200
+        }
+        if jMax - jMin > 400 {
+            let mid = (jMin + jMax) / 2
+            jMin = mid - 200
+            jMax = mid + 200
+        }
+        let minorR: CGFloat = 1.1
+        let majorR: CGFloat = 1.8
+        ctx.setFillColor(minorColor.cgColor)
+        ctx.beginPath()
+        for k in kMin...kMax {
+            for j in jMin...jMax {
+                if k % majorEvery == 0, j % majorEvery == 0 { continue }
+                let p = vp.worldToScreen(CGPoint(x: CGFloat(k) * step, y: CGFloat(j) * step))
+                ctx.addEllipse(in: CGRect(x: p.x - minorR, y: p.y - minorR, width: minorR * 2, height: minorR * 2))
+            }
+        }
+        ctx.fillPath()
+        ctx.setFillColor(majorColor.cgColor)
+        ctx.beginPath()
+        for k in stride(from: kMin - kMin % majorEvery, through: kMax, by: majorEvery) {
+            for j in stride(from: jMin - jMin % majorEvery, through: jMax, by: majorEvery) {
+                let p = vp.worldToScreen(CGPoint(x: CGFloat(k) * step, y: CGFloat(j) * step))
+                ctx.addEllipse(in: CGRect(x: p.x - majorR, y: p.y - majorR, width: majorR * 2, height: majorR * 2))
+            }
+        }
+        ctx.fillPath()
     }
 
     private func drawAxes(ctx: CGContext, viewport vp: Viewport, visible: CGRect) {

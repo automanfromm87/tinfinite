@@ -316,6 +316,57 @@ do {
     check(!line.isTap && line.spine.count >= 2, "real line kept")
 }
 
+// ---------- 13. HSV 与色轮几何 ----------
+do {
+    // 已知色：红/绿/蓝/黑/白
+    let red = HSV(rgba: RGBA(r: 1, g: 0, b: 0, a: 1))
+    check(approx(red.h, 0) && approx(red.s, 1) && approx(red.v, 1), "red hsv")
+    let green = HSV(rgba: RGBA(r: 0, g: 1, b: 0, a: 1))
+    check(approx(green.h, 1.0 / 3), "green hue \(green.h)")
+    let blue = HSV(rgba: RGBA(r: 0, g: 0, b: 1, a: 1))
+    check(approx(blue.h, 2.0 / 3), "blue hue \(blue.h)")
+    let black = HSV(rgba: .black)
+    check(black.s == 0 && black.v == 0, "black")
+    let white = HSV(rgba: .white)
+    check(white.s == 0 && approx(white.v, 1), "white")
+    // 往返：HSV -> RGB -> HSV 一致（Float 量化误差内）
+    for h in stride(from: 0.0, to: 1.0, by: 0.07) {
+        for s in stride(from: 0.0, through: 1.0, by: 0.25) {
+            for v in stride(from: 0.0, through: 1.0, by: 0.25) {
+                let rt = HSV(rgba: HSV(h: h, s: s, v: v).rgba())
+                // v=0 全体坍缩成黑（h/s 丢失是定义使然）；s=0 时 h 无意义
+                let hueOK = s == 0 || v == 0 || approx(rt.h, h, eps: 0.01) || approx(rt.h, h + 1, eps: 0.01) || approx(rt.h, h - 1, eps: 0.01)
+                let satOK = v == 0 || approx(rt.s, s, eps: 0.01)
+                check(hueOK && satOK && approx(rt.v, v, eps: 0.01),
+                      "hsv roundtrip h=\(h) s=\(s) v=\(v) got \(rt)")
+            }
+        }
+    }
+    // 色轮几何：上=红(h=0)，右=0.25，下=0.5，左=0.75；圆心 s=0；圆外钳制
+    let c = CGPoint(x: 100, y: 100)
+    let top = ColorWheelMath.hueSaturation(at: CGPoint(x: 100, y: 0), center: c, radius: 100)
+    check(approx(top.h, 0) && approx(top.s, 1), "wheel top red")
+    let right = ColorWheelMath.hueSaturation(at: CGPoint(x: 200, y: 100), center: c, radius: 100)
+    check(approx(right.h, 0.25) && approx(right.s, 1), "wheel right")
+    let bottom = ColorWheelMath.hueSaturation(at: CGPoint(x: 100, y: 200), center: c, radius: 100)
+    check(approx(bottom.h, 0.5), "wheel bottom")
+    let left = ColorWheelMath.hueSaturation(at: CGPoint(x: 0, y: 100), center: c, radius: 100)
+    check(approx(left.h, 0.75), "wheel left")
+    let middle = ColorWheelMath.hueSaturation(at: c, center: c, radius: 100)
+    check(approx(middle.s, 0), "wheel center desaturated")
+    let outside = ColorWheelMath.hueSaturation(at: CGPoint(x: 100, y: -200), center: c, radius: 100)
+    check(approx(outside.h, 0) && approx(outside.s, 1), "wheel outside clamps")
+    // 指示器定位与拾取互逆
+    for h in stride(from: 0.0, to: 1.0, by: 0.11) {
+        for s in stride(from: 0.0, through: 1.0, by: 0.2) {
+            let p = ColorWheelMath.position(hue: h, saturation: s, center: c, radius: 100)
+            let back = ColorWheelMath.hueSaturation(at: p, center: c, radius: 100)
+            let hueOK = s < 0.01 || approx(back.h, h, eps: 0.01) || approx(back.h, h + 1, eps: 0.01)
+            check(hueOK && approx(back.s, s, eps: 0.01), "wheel inverse h=\(h) s=\(s)")
+        }
+    }
+}
+
 if failures == 0 { print("ALL DRAWING-MATH TESTS PASSED") }
 else { print("\(failures) FAILURES") }
 exit(failures == 0 ? 0 : 1)

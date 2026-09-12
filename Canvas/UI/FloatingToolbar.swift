@@ -9,10 +9,12 @@ struct FloatingToolbar: View {
     @ObservedObject var drawing: DrawingSettings
     var onResetCamera: () -> Void
     var onFitContent: () -> Void
-    @Binding var showGrid: Bool
+    @Binding var paper: PaperTheme
+    @Binding var gridStyle: GridStyle
     @Binding var showMinimap: Bool
     @State private var expanded: Bool
     @State private var photoItem: PhotosPickerItem?
+    @State private var showingColorWheel = false
 
     /// DEBUG 启动参数 -CanvasShowTools：展开状态启动（截图验证用）
     static var debugStartExpanded: Bool {
@@ -23,9 +25,10 @@ struct FloatingToolbar: View {
         #endif
     }
 
-    init(drawing: DrawingSettings, showGrid: Binding<Bool>, showMinimap: Binding<Bool>, onResetCamera: @escaping () -> Void, onFitContent: @escaping () -> Void, startExpanded: Bool = false) {
+    init(drawing: DrawingSettings, paper: Binding<PaperTheme>, gridStyle: Binding<GridStyle>, showMinimap: Binding<Bool>, onResetCamera: @escaping () -> Void, onFitContent: @escaping () -> Void, startExpanded: Bool = false) {
         self.drawing = drawing
-        self._showGrid = showGrid
+        self._paper = paper
+        self._gridStyle = gridStyle
         self._showMinimap = showMinimap
         self.onResetCamera = onResetCamera
         self.onFitContent = onFitContent
@@ -37,6 +40,10 @@ struct FloatingToolbar: View {
             if expanded {
                 panel
                     .transition(.scale(scale: 0.9, anchor: .bottomTrailing).combined(with: .opacity))
+            } else if drawing.mode == .draw && drawing.tool != .lasso {
+                // 收起态常驻速调条：不用展开面板就能改笔宽
+                quickStrip
+                    .transition(.opacity)
             }
             Button {
                 withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
@@ -56,10 +63,42 @@ struct FloatingToolbar: View {
         }
     }
 
+    // MARK: - 速调条（收起态常驻）
+
+    /// 笔宽速调：预览点 + 滑杆，与面板内的笔触区共用同一 binding
+    private var quickStrip: some View {
+        HStack(spacing: 10) {
+            Circle()
+                .fill(strokePreviewColor)
+                .frame(width: quickDotSize, height: quickDotSize)
+                .frame(width: 26, height: 26)
+            Slider(value: widthBinding, in: widthRange, step: 1)
+                .tint(.accentColor)
+                .accessibilityIdentifier("quickWidthSlider")
+            Text("\(Int(widthBinding.wrappedValue))")
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .frame(width: 26)
+                .accessibilityIdentifier("quickWidthValue")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(width: 240)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
+        .shadow(color: .black.opacity(0.15), radius: 8, y: 4)
+    }
+
+    /// 预览点直径（映射笔宽，钳在可视范围）
+    private var quickDotSize: CGFloat {
+        min(max(widthBinding.wrappedValue * 0.6, 3), 22)
+    }
+
     // MARK: - 展开面板
 
     private var panel: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        // 选项多时小屏放不下：纵向滚动，上限 560pt
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 12) {
             // 工具
             sectionLabel("工具")
             HStack(spacing: 10) {
@@ -107,30 +146,51 @@ struct FloatingToolbar: View {
                 .pickerStyle(.segmented)
             }
 
-            // 颜色（仅画笔）
+            // 颜色（仅画笔）：快捷 + 常用 + 色轮
             if drawing.tool == .pen {
                 sectionLabel("颜色")
-                HStack(spacing: 12) {
-                    ForEach(drawing.palette, id: \.self) { rgba in
-                        let selected = drawing.color == rgba
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 12) {
+                        ForEach(drawing.palette, id: \.self) { rgba in
+                            swatchButton(rgba, identifier: "paletteSwatch")
+                        }
+                        if !drawing.recentColors.isEmpty {
+                            Divider().frame(height: 26)
+                            ForEach(drawing.recentColors, id: \.self) { rgba in
+                                swatchButton(rgba, identifier: "recentSwatch")
+                            }
+                        }
+                        Divider().frame(height: 26)
+                        // 色轮入口：当前色不在任何快选里时视为选中
                         Button {
-                            drawing.color = rgba
+                            showingColorWheel = true
                         } label: {
                             Circle()
-                                .fill(rgba.swiftUIColor)
+                                .fill(conicRainbow)
                                 .frame(width: 26, height: 26)
                                 .overlay(
                                     Circle().stroke(
-                                        selected ? Color.primary : Color.primary.opacity(0.15),
-                                        lineWidth: selected ? 2.5 : 1
+                                        isCustomColorSelected ? Color.primary : Color.primary.opacity(0.15),
+                                        lineWidth: isCustomColorSelected ? 2.5 : 1
                                     )
                                 )
-                                .scaleEffect(selected ? 1.12 : 1.0)
+                                .scaleEffect(isCustomColorSelected ? 1.12 : 1.0)
                         }
                         .buttonStyle(.plain)
+                        .accessibilityIdentifier("colorWheelButton")
                     }
+                    .padding(.horizontal, 2)
                 }
                 .frame(maxWidth: .infinity)
+                .popover(isPresented: $showingColorWheel) {
+                    ColorWheelView(color: $drawing.color)
+                }
+                .onChange(of: showingColorWheel) { wasShowing, isShowing in
+                    // 色轮关闭时把自选色记入常用
+                    if wasShowing, !isShowing {
+                        drawing.commitCustomColor(drawing.color)
+                    }
+                }
             }
 
             // 笔触预览 + 笔宽（套索除外）
@@ -206,9 +266,26 @@ struct FloatingToolbar: View {
 
             Divider()
 
+            // 纸张
+            sectionLabel("纸张")
+            HStack(spacing: 10) {
+                paperButton(theme: .system, icon: "circle.lefthalf.filled", label: "系统")
+                paperButton(theme: .white, icon: "square.fill", label: "白纸")
+                paperButton(theme: .black, icon: "square.fill", label: "黑纸")
+            }
+
+            // 网格
+            sectionLabel("网格")
+            Picker("网格", selection: $gridStyle) {
+                Text("线格").tag(GridStyle.lines)
+                Text("点阵").tag(GridStyle.dots)
+                Text("关").tag(GridStyle.off)
+            }
+            .pickerStyle(.segmented)
+            .accessibilityIdentifier("gridStylePicker")
+
             // 画布开关
             HStack(spacing: 10) {
-                toggleButton(icon: "grid", label: "网格", on: showGrid) { showGrid.toggle() }
                 toggleButton(icon: "hand.tap.fill", label: "手绘", on: drawing.allowFingerDrawing) {
                     drawing.allowFingerDrawing.toggle()
                 }
@@ -252,9 +329,12 @@ struct FloatingToolbar: View {
                     .font(.caption)
                     .foregroundStyle(.tertiary)
             }
+            }
         }
+        .accessibilityIdentifier("toolPanel")
         .padding(16)
         .frame(width: 300)
+        .frame(maxHeight: 560)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20))
         .shadow(color: .black.opacity(0.2), radius: 12, y: 6)
     }
@@ -266,6 +346,40 @@ struct FloatingToolbar: View {
             .font(.caption2.weight(.semibold))
             .foregroundStyle(.tertiary)
             .padding(.bottom, -6)
+    }
+
+    /// 单个色块按钮（快捷/常用共用）
+    private func swatchButton(_ rgba: RGBA, identifier: String) -> some View {
+        let selected = drawing.color == rgba
+        return Button {
+            drawing.color = rgba
+        } label: {
+            Circle()
+                .fill(rgba.swiftUIColor)
+                .frame(width: 26, height: 26)
+                .overlay(
+                    Circle().stroke(
+                        selected ? Color.primary : Color.primary.opacity(0.15),
+                        lineWidth: selected ? 2.5 : 1
+                    )
+                )
+                .scaleEffect(selected ? 1.12 : 1.0)
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier(identifier)
+    }
+
+    /// 当前色是否来自色轮自选（不在快捷/常用里）
+    private var isCustomColorSelected: Bool {
+        var rgb = drawing.color
+        rgb.a = 1
+        return !drawing.palette.contains(rgb) && !drawing.recentColors.contains(rgb)
+    }
+
+    /// 彩虹锥形渐变（色轮入口图标用；纯装饰，方向无语义）
+    private var conicRainbow: AngularGradient {
+        AngularGradient(colors: [.red, .yellow, .green, .cyan, .blue, .purple, .red],
+                         center: .center)
     }
 
     private func toolButton(icon: String, selected: Bool, action: @escaping () -> Void) -> some View {
@@ -310,6 +424,29 @@ struct FloatingToolbar: View {
             .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
         }
         .buttonStyle(.plain)
+    }
+
+    /// 纸张选择钮（选中态高亮）
+    private func paperButton(theme: PaperTheme, icon: String, label: String) -> some View {
+        let selected = paper == theme
+        return Button {
+            paper = theme
+        } label: {
+            VStack(spacing: 2) {
+                Image(systemName: icon)
+                    .font(.title3)
+                Text(label)
+                    .font(.caption2)
+            }
+            .foregroundStyle(selected ? Color.accentColor : .secondary)
+            .frame(width: 56, height: 48)
+            .background(
+                selected ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.06),
+                in: RoundedRectangle(cornerRadius: 12)
+            )
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("paper\(theme.rawValue.capitalized)")
     }
 
     private func toggleButton(icon: String, label: String, on: Bool, action: @escaping () -> Void) -> some View {

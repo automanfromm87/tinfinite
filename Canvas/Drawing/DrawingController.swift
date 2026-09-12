@@ -254,6 +254,12 @@ final class DrawingController: NSObject {
             }
         }
         isLiveStrokeActive = true
+        // 落笔中途关掉双指撤销手势（第二根手指点按不应撤掉已提交的笔画）
+        canvas.isUndoGestureEnabled = false
+        // 笔触落笔时禁用 pan：手掌 resting 在屏上拖动不会平移画布
+        if touch.type == .pencil {
+            canvas.panGesture.isEnabled = false
+        }
         onChange?()
     }
 
@@ -297,6 +303,9 @@ final class DrawingController: NSObject {
         isLiveStrokeActive = false
         strokeView?.setLiveMesh(nil)
         clearDragHints()
+        // 恢复触摸策略（撤销手势 + 笔触禁掉的 pan）
+        canvas.isUndoGestureEnabled = true
+        applyTouchPolicy()
         onChange?()
     }
 
@@ -315,6 +324,9 @@ final class DrawingController: NSObject {
         isLiveStrokeActive = false
         strokeView?.setLiveMesh(nil)
         clearDragHints()
+        // 与 endEdit 同步恢复（取消路径也要还回 pan/撤销手势）
+        canvas?.isUndoGestureEnabled = true
+        applyTouchPolicy()
         onChange?()
     }
 

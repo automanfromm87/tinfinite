@@ -22,6 +22,76 @@ nonisolated struct RGBA: Equatable, Sendable, Codable, Hashable {
     var simd: SIMD4<Float> { SIMD4<Float>(r, g, b, a) }
 }
 
+// MARK: - HSV 颜色（色轮用；h/s/v 均为 0...1）
+
+/// HSV 颜色（色轮拾取用）。h=0 为正红，顺时针增大。
+nonisolated struct HSV: Equatable, Sendable {
+    var h, s, v: CGFloat
+
+    init(h: CGFloat, s: CGFloat, v: CGFloat) {
+        self.h = h
+        self.s = s
+        self.v = v
+    }
+
+    init(rgba: RGBA) {
+        let r = CGFloat(rgba.r), g = CGFloat(rgba.g), b = CGFloat(rgba.b)
+        let mx = max(r, g, b), mn = min(r, g, b)
+        let d = mx - mn
+        v = mx
+        s = mx > 0 ? d / mx : 0
+        if d == 0 {
+            h = 0
+        } else if mx == r {
+            h = ((g - b) / d).truncatingRemainder(dividingBy: 6) / 6
+            if h < 0 { h += 1 }
+        } else if mx == g {
+            h = ((b - r) / d + 2) / 6
+        } else {
+            h = ((r - g) / d + 4) / 6
+        }
+    }
+
+    func rgba(alpha: Float = 1) -> RGBA {
+        let h6 = (h - floor(h)) * 6
+        let c = v * s
+        let x = c * (1 - abs(h6.truncatingRemainder(dividingBy: 2) - 1))
+        let (r, g, b): (CGFloat, CGFloat, CGFloat)
+        switch Int(floor(h6)) {
+        case 0: (r, g, b) = (c, x, 0)
+        case 1: (r, g, b) = (x, c, 0)
+        case 2: (r, g, b) = (0, c, x)
+        case 3: (r, g, b) = (0, x, c)
+        case 4: (r, g, b) = (x, 0, c)
+        default: (r, g, b) = (c, 0, x)
+        }
+        let m = v - c
+        return RGBA(r: Float(r + m), g: Float(g + m), b: Float(b + m), a: alpha)
+    }
+}
+
+/// 色轮几何：圆心为白（s=0），边缘为纯色（s=1），h=0 在正上方顺时针增大。
+nonisolated enum ColorWheelMath {
+    /// 触摸点 -> (h, s)。圆外钳制到边缘。
+    static func hueSaturation(at point: CGPoint, center: CGPoint, radius: CGFloat) -> (h: CGFloat, s: CGFloat) {
+        guard radius > 0 else { return (0, 0) }
+        let dx = point.x - center.x
+        let dy = point.y - center.y
+        let dist = min(hypot(dx, dy), radius)
+        // atan2 以 +x 轴为 0；+90° 把 0 点搬到正上方（h 顺时针增大）
+        var angle = atan2(dy, dx) + .pi / 2
+        if angle < 0 { angle += 2 * .pi }
+        return (angle / (2 * .pi), dist / radius)
+    }
+
+    /// (h, s) -> 轮上点（指示器定位用，与上互逆）
+    static func position(hue h: CGFloat, saturation s: CGFloat, center: CGPoint, radius: CGFloat) -> CGPoint {
+        let angle = h * 2 * .pi - .pi / 2
+        let d = min(max(s, 0), 1) * radius
+        return CGPoint(x: center.x + d * cos(angle), y: center.y + d * sin(angle))
+    }
+}
+
 // MARK: - 笔样式
 
 /// 笔刷种类：决定笔尖响应（压力/倾斜 -> 宽度/不透明度）与渲染层级（荧光笔在墨线下）。

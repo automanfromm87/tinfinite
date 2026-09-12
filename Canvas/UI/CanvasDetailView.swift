@@ -16,7 +16,8 @@ struct CanvasDetailView: View {
     @StateObject private var model = InfiniteCanvasModel()
     @StateObject private var drawing = DrawingSettings()
     @StateObject private var refs = CanvasRefs()
-    @State private var showGrid = true
+    @AppStorage(PaperTheme.defaultsKey) private var paper: PaperTheme = .system
+    @AppStorage(GridStyle.defaultsKey) private var gridStyle: GridStyle = .lines
     @State private var showMinimap = false
     @State private var renaming = false
     @State private var renameText = ""
@@ -58,8 +59,9 @@ struct CanvasDetailView: View {
         ZStack {
             InfiniteCanvas(
                     model: model,
-                    showGrid: showGrid,
-                    onCreate: { [drawing, model, refs, gridBinding = $showGrid] canvas in
+                    paper: paper,
+                    gridStyle: gridStyle,
+                    onCreate: { [drawing, model, refs, gridBinding = $gridStyle] canvas in
                     refs.canvas = canvas
                     // 点选：只在 navigate 模式响应（绘画模式点按=落笔，由笔触管线处理）。
                     // 命中节点选节点，否则走笔画点选 + 取消节点选中。
@@ -103,7 +105,8 @@ struct CanvasDetailView: View {
                             case .toolLasso:
                                 drawing.mode = .draw
                                 drawing.tool = .lasso
-                            case .toggleGrid: gridBinding.wrappedValue.toggle()
+                            // 快捷键 g：关 <-> 线（点阵视为开，按一下直接关）
+                            case .toggleGrid: gridBinding.wrappedValue = gridBinding.wrappedValue == .off ? .lines : .off
                             case .zoomIn: zoom(by: 1.25)
                             case .zoomOut: zoom(by: 0.8)
                             case .resetCamera: model.reset()
@@ -192,7 +195,8 @@ struct CanvasDetailView: View {
                     Spacer()
                     FloatingToolbar(
                         drawing: drawing,
-                        showGrid: $showGrid,
+                        paper: $paper,
+                        gridStyle: $gridStyle,
                         showMinimap: $showMinimap,
                         onResetCamera: { model.reset() },
                         onFitContent: { fitContent() },
