@@ -43,6 +43,11 @@ final class DrawingSettings: ObservableObject {
         didSet { controller?.tool = tool }
     }
 
+    /// 当前笔刷（钢笔/荧光笔/墨水笔/铅笔；切换时重建样式）
+    @Published var brush: BrushKind = .pen {
+        didSet { pushStyle() }
+    }
+
     /// 当前笔色
     @Published var color: RGBA = .black {
         didSet { pushStyle() }
@@ -117,7 +122,20 @@ final class DrawingSettings: ObservableObject {
     func addImage(data: Data) { controller?.addImage(data: data) }
 
     private func pushStyle() {
-        controller?.style = .pen(color: color, width: max(lineWidth, 0.5))
+        let width = max(lineWidth, 0.5)
+        switch brush {
+        case .pen:
+            controller?.style = .pen(color: color, width: width)
+        case .highlighter:
+            // 荧光笔用选取色但固定半透明（保证盖住字迹仍可读）
+            var c = color
+            c.a = 0.45
+            controller?.style = .highlighter(color: c, width: width)
+        case .fountainPen:
+            controller?.style = .fountainPen(color: color, width: width)
+        case .pencil:
+            controller?.style = .pencil(color: color, width: width)
+        }
     }
 
     /// 从 controller 拉取状态。所有赋值必须先判等再写：@Published 即使同值

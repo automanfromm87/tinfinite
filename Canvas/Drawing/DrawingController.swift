@@ -398,8 +398,9 @@ final class DrawingController: NSObject {
                 return
             }
             strokeView.setLiveMesh(StrokeGeometry.tessellate(
-                spine: spine, color: style.color, flattenTolerance: currentTolerance()
-            ))
+                spine: spine, color: style.color, flattenTolerance: currentTolerance(),
+                grain: style.grain
+            ), kind: style.kind)
         case .eraser:
             overlay?.lassoEnds = nil
             strokeView.setLiveMesh(trailMesh(width: eraserWidth))
@@ -824,7 +825,7 @@ final class DrawingController: NSObject {
             strokeView.removeMeshes(ids: sync.removedIDs)
         }
         for u in sync.upserts {
-            strokeView.upsertMesh(id: u.id, mesh: u.mesh, bounds: u.bounds)
+            strokeView.upsertMesh(id: u.id, mesh: u.mesh, bounds: u.bounds, kind: u.kind)
         }
         for m in sync.inPlace {
             strokeView.updateMeshInPlace(id: m.id, mesh: m.mesh, bounds: m.bounds)

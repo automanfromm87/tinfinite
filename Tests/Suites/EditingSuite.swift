@@ -36,6 +36,15 @@ do {
     check(!sync.upserts[0].mesh.isEmpty, "commit mesh built")
     check(s.spine.count == 11, "spine kept \(s.spine.count)")
     check(store.canUndo && !store.canRedo, "undo available")
+    // 笔刷 kind 透传到渲染增量（渲染层级用；独立 store，不污染块内 undo 断言）
+    var kstore = StrokeStore()
+    _ = kstore.addSynthetic(points: linePoints(x0: 0, x1: 10, y: 0, n: 6), style: testStyle, tolerance: 0.35)!
+    let (sHi, syncHi) = kstore.addSynthetic(
+        points: linePoints(x0: 0, x1: 10, y: 5, n: 6),
+        style: StrokeStyle.highlighter(), tolerance: 0.35)!
+    check(sHi.style.kind == .highlighter, "style kind kept")
+    check(syncHi.upserts.first?.kind == .highlighter, "sync carries kind")
+    check(kstore.renderData().map(\.kind) == [.pen, .highlighter], "renderData carries kinds")
 
     let u = store.undo()!
     check(store.strokes.isEmpty && u.removedIDs == [s.id], "undo removes")

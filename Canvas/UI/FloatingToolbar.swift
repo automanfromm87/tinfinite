@@ -96,6 +96,17 @@ struct FloatingToolbar: View {
                 .pickerStyle(.segmented)
             }
 
+            // 笔刷（仅画笔工具）
+            if drawing.tool == .pen {
+                Picker("笔刷", selection: $drawing.brush) {
+                    Text("硬笔").tag(BrushKind.pen)
+                    Text("荧光笔").tag(BrushKind.highlighter)
+                    Text("钢笔").tag(BrushKind.fountainPen)
+                    Text("铅笔").tag(BrushKind.pencil)
+                }
+                .pickerStyle(.segmented)
+            }
+
             // 颜色（仅画笔）
             if drawing.tool == .pen {
                 sectionLabel("颜色")
@@ -341,7 +352,10 @@ struct FloatingToolbar: View {
     }
 
     private var strokePreviewColor: Color {
-        drawing.tool == .pen ? drawing.color.swiftUIColor : Color.gray.opacity(0.7)
+        guard drawing.tool == .pen else { return Color.gray.opacity(0.7) }
+        // 荧光笔预览半透明（与实际落笔一致）
+        if drawing.brush == .highlighter { return drawing.color.swiftUIColor.opacity(0.45) }
+        return drawing.color.swiftUIColor
     }
 
     private var strokePreviewHeight: CGFloat {

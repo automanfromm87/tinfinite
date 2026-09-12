@@ -92,7 +92,13 @@ struct DocumentThumbnailView: View {
             } else {
                 points = centers
             }
-            return (points, stroke.style.color)
+            // 透明度取 spine 平均（倾斜变淡在缩略图中保留）
+            var color = stroke.style.color
+            if !stroke.spine.isEmpty {
+                let avg = stroke.spine.reduce(0 as CGFloat) { $0 + $1.alpha } / CGFloat(stroke.spine.count)
+                color.a *= Float(min(max(avg, 0), 1))
+            }
+            return (points, color)
         }
     }
 }

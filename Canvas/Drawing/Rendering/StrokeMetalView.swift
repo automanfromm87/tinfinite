@@ -79,6 +79,8 @@ final class StrokeMetalView: MTKView, MTKViewDelegate {
     private var meshes: [UUID: StrokeMesh] = [:]
     private var boundsMap: [UUID: CGRect] = [:]
     private var ranges: [UUID: IndexRange] = [:]
+    /// 笔刷种类（渲染层级用：荧光笔先画，落在墨线下；缺省=普通笔）
+    private var kindMap: [UUID: BrushKind] = [:]
 
     private struct IndexRange {
         var vertexOffset: Int  // 以顶点为单位（draw 用 baseVertex）
@@ -113,6 +115,8 @@ final class StrokeMetalView: MTKView, MTKViewDelegate {
     private var liveVertexCapacity = 0
     private var liveIndexCapacity = 0
     private var liveIndexCount = 0
+    /// live 笔刷种类（荧光笔 live 先画，避免提交时从上层“掉”到底层造成闪烁）
+    private var liveKind: BrushKind = .pen
     /// live 顶点 CPU 侧缓存（绝对坐标；rebase 时重传用）
     private var liveVerticesCache: [StrokeVertex] = []
 
@@ -203,13 +207,16 @@ final class StrokeMetalView: MTKView, MTKViewDelegate {
             meshes.removeValue(forKey: id)
             boundsMap.removeValue(forKey: id)
             ranges.removeValue(forKey: id)
+            kindMap.removeValue(forKey: id)
         }
         if !removed.isEmpty {
             order.removeAll { removed.contains($0) }
         }
 
         // 新增：append 到 buffer 尾
-        for s in strokes where !oldSet.contains(s.id) || ranges[s.id] == nil {
+        for s in strokes {
+            kindMap[s.id] = s.kind
+            guard !oldSet.contains(s.id) || ranges[s.id] == nil else { continue }
             guard appendMesh(s.mesh, id: s.id) else { continue }
             meshes[s.id] = s.mesh
             boundsMap[s.id] = s.bounds
@@ -220,13 +227,14 @@ final class StrokeMetalView: MTKView, MTKViewDelegate {
     }
 
     /// 增量 upsert 一笔（新增 append、已存在替换为新区段）。LOD/碎片/撤销恢复用。
-    func upsertMesh(id: UUID, mesh: StrokeMesh, bounds: CGRect) {
+    func upsertMesh(id: UUID, mesh: StrokeMesh, bounds: CGRect, kind: BrushKind = .pen) {
         if let range = ranges[id] {
             holeVertices += meshes[id]?.vertices.count ?? 0
             holeIndices += range.indexCount
         }
         meshes[id] = mesh
         boundsMap[id] = bounds
+        kindMap[id] = kind
         if !mesh.isEmpty {
             appendMesh(mesh, id: id)
         } else {
@@ -253,6 +261,7 @@ final class StrokeMetalView: MTKView, MTKViewDelegate {
             meshes.removeValue(forKey: id)
             boundsMap.removeValue(forKey: id)
             ranges.removeValue(forKey: id)
+            kindMap.removeValue(forKey: id)
             changed = true
         }
         if changed {
@@ -283,7 +292,8 @@ final class StrokeMetalView: MTKView, MTKViewDelegate {
     }
 
     /// 更新 live 笔画 mesh（nil = 清除）。每输入事件调用。
-    func setLiveMesh(_ mesh: StrokeMesh?) {
+    func setLiveMesh(_ mesh: StrokeMesh?, kind: BrushKind = .pen) {
+        liveKind = kind
         guard let mesh, !mesh.isEmpty else {
             liveIndexCount = 0
             liveVerticesCache = []
@@ -465,28 +475,47 @@ final class StrokeMetalView: MTKView, MTKViewDelegate {
         encoder.setVertexBytes(&uniforms, length: MemoryLayout<StrokeUniforms>.stride, index: 1)
         encoder.setCullMode(.none)
 
-        // 已提交笔画（逐笔画视锥裁剪）
+        // 已提交笔画（逐笔画视锥裁剪；荧光笔先画，落在墨线下，各层内保 z 序）
         if let vb = vertexBuffer, let ib = indexBuffer, !order.isEmpty {
             let visible = viewport.visibleWorldRect
             encoder.setVertexBuffer(vb, offset: 0, index: 0)
-            for id in order {
-                guard let range = ranges[id] else { continue }
-                if let b = boundsMap[id], !b.isNull, !b.intersects(visible) { continue }
-                encoder.drawIndexedPrimitives(
-                    type: .triangle,
-                    indexCount: range.indexCount,
-                    indexType: .uint32,
-                    indexBuffer: ib,
-                    indexBufferOffset: range.indexOffset * 4,
-                    instanceCount: 1,
-                    baseVertex: range.vertexOffset,
-                    baseInstance: 0
-                )
+            func drawCommitted(highlighters: Bool) {
+                for id in order {
+                    let isHi = kindMap[id] == .highlighter
+                    guard isHi == highlighters, let range = ranges[id] else { continue }
+                    if let b = boundsMap[id], !b.isNull, !b.intersects(visible) { continue }
+                    encoder.drawIndexedPrimitives(
+                        type: .triangle,
+                        indexCount: range.indexCount,
+                        indexType: .uint32,
+                        indexBuffer: ib,
+                        indexBufferOffset: range.indexOffset * 4,
+                        instanceCount: 1,
+                        baseVertex: range.vertexOffset,
+                        baseInstance: 0
+                    )
+                }
             }
-        }
-
-        // Live 笔画（不裁剪，必在附近）
-        if liveIndexCount > 0, let lvb = liveVertexBuffer, let lib = liveIndexBuffer {
+            func drawLive() {
+                if liveIndexCount > 0, let lvb = liveVertexBuffer, let lib = liveIndexBuffer {
+                    encoder.setVertexBuffer(lvb, offset: 0, index: 0)
+                    encoder.drawIndexedPrimitives(
+                        type: .triangle,
+                        indexCount: liveIndexCount,
+                        indexType: .uint32,
+                        indexBuffer: lib,
+                        indexBufferOffset: 0
+                    )
+                    encoder.setVertexBuffer(vb, offset: 0, index: 0)
+                }
+            }
+            // Live 笔画（不裁剪，必在附近）：荧光笔 live 与提交荧光笔同层先画
+            if liveKind == .highlighter { drawLive() }
+            drawCommitted(highlighters: true)
+            drawCommitted(highlighters: false)
+            if liveKind != .highlighter { drawLive() }
+        } else if liveIndexCount > 0, let lvb = liveVertexBuffer, let lib = liveIndexBuffer {
+            // 无已提交笔画时 live 独画
             encoder.setVertexBuffer(lvb, offset: 0, index: 0)
             encoder.drawIndexedPrimitives(
                 type: .triangle,

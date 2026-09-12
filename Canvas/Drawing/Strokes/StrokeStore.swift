@@ -61,13 +61,13 @@ nonisolated struct StrokeStore: Sendable {
         style: StrokeStyle, tolerance: CGFloat
     ) -> (Stroke, RenderSync) {
         currentTolerance = tolerance
-        let mesh = StrokeGeometry.tessellate(spine: spine, color: style.color, flattenTolerance: tolerance)
+        let mesh = StrokeGeometry.tessellate(spine: spine, color: style.color, flattenTolerance: tolerance, grain: style.grain)
         let stroke = Stroke(points: rawPoints, style: style, bounds: StrokeGeometry.bounds(of: spine), spine: spine)
         strokes.append(stroke)
         meshes[stroke.id] = mesh
         grid.insert(id: stroke.id, bounds: stroke.bounds)
         pushUndo(.added(stroke: stroke))
-        return (stroke, RenderSync(upserts: [RenderedStroke(id: stroke.id, mesh: mesh, bounds: stroke.bounds)]))
+        return (stroke, RenderSync(upserts: [RenderedStroke(id: stroke.id, mesh: mesh, bounds: stroke.bounds, kind: stroke.style.kind)]))
     }
 
     /// 合成笔画（Demo/导入）：世界点列 -> 重采样 spine -> 提交
@@ -79,7 +79,7 @@ nonisolated struct StrokeStore: Sendable {
         return commitStroke(rawPoints: points, spine: spine, style: style, tolerance: tolerance)
     }
 
-    /// 世界空间轻量重采样（合成点列用）
+    /// 世界空间轻量重采样（合成点列/旧 spine 缺失回填用；倾斜按存档值参与笔尖响应）
     static func resampleWorld(points: [StrokePoint], style: StrokeStyle) -> [SpinePoint] {
         let minSpacing = max(0.25, style.baseWidth * 0.05)
         var spine: [SpinePoint] = []
@@ -91,7 +91,8 @@ nonisolated struct StrokeStore: Sendable {
                 let dy = p.position.y - last.center.y
                 if dx * dx + dy * dy < minSpacing * minSpacing { continue }
             }
-            spine.append(SpinePoint(center: p.position, width: style.width(forPressure: p.pressure)))
+            let nib = style.nib(pressure: p.pressure, altitude: p.altitude)
+            spine.append(SpinePoint(center: p.position, width: nib.width, alpha: nib.alpha))
         }
         return spine
     }
@@ -180,7 +181,7 @@ nonisolated struct StrokeStore: Sendable {
                 for f in frags {
                     meshes[f.stroke.id] = f.mesh
                     grid.insert(id: f.stroke.id, bounds: f.stroke.bounds)
-                    upserts.append(RenderedStroke(id: f.stroke.id, mesh: f.mesh, bounds: f.stroke.bounds))
+                    upserts.append(RenderedStroke(id: f.stroke.id, mesh: f.mesh, bounds: f.stroke.bounds, kind: f.stroke.style.kind))
                 }
             }
         }
@@ -208,7 +209,7 @@ nonisolated struct StrokeStore: Sendable {
                 points: raw, style: stroke.style,
                 bounds: StrokeGeometry.bounds(of: run), spine: run
             )
-            let m = StrokeGeometry.tessellate(spine: run, color: stroke.style.color, flattenTolerance: tolerance)
+            let m = StrokeGeometry.tessellate(spine: run, color: stroke.style.color, flattenTolerance: tolerance, grain: stroke.style.grain)
             return (s, m)
         }
     }
@@ -337,9 +338,9 @@ nonisolated struct StrokeStore: Sendable {
         let set = Set(ids)
         var upserts: [RenderedStroke] = []
         for s in strokes where set.contains(s.id) {
-            let mesh = StrokeGeometry.tessellate(spine: s.spine, color: s.style.color, flattenTolerance: tolerance)
+            let mesh = StrokeGeometry.tessellate(spine: s.spine, color: s.style.color, flattenTolerance: tolerance, grain: s.style.grain)
             meshes[s.id] = mesh
-            upserts.append(RenderedStroke(id: s.id, mesh: mesh, bounds: s.bounds))
+            upserts.append(RenderedStroke(id: s.id, mesh: mesh, bounds: s.bounds, kind: s.style.kind))
         }
         return RenderSync(upserts: upserts)
     }
@@ -347,7 +348,7 @@ nonisolated struct StrokeStore: Sendable {
     // MARK: - 全量
 
     func renderData() -> [RenderedStroke] {
-        strokes.map { s in RenderedStroke(id: s.id, mesh: meshFor(s), bounds: s.bounds) }
+        strokes.map { s in RenderedStroke(id: s.id, mesh: meshFor(s), bounds: s.bounds, kind: s.style.kind) }
     }
 
     /// 全量替换（加载存档）：清空历史，从 spine 重建 mesh（spine 为空的旧数据从 points 回填）
@@ -363,7 +364,8 @@ nonisolated struct StrokeStore: Sendable {
                 strokes[i].spine = Self.resampleWorld(points: strokes[i].points, style: strokes[i].style)
             }
             meshes[strokes[i].id] = StrokeGeometry.tessellate(
-                spine: strokes[i].spine, color: strokes[i].style.color, flattenTolerance: tolerance
+                spine: strokes[i].spine, color: strokes[i].style.color, flattenTolerance: tolerance,
+                grain: strokes[i].style.grain
             )
         }
         grid.rebuild(strokes: strokes.map { (id: $0.id, bounds: $0.bounds) })
@@ -394,7 +396,7 @@ nonisolated struct StrokeStore: Sendable {
                 grid.insert(id: item.stroke.id, bounds: item.stroke.bounds)
                 let mesh = meshFor(item.stroke)
                 meshes[item.stroke.id] = mesh
-                upserts.append(RenderedStroke(id: item.stroke.id, mesh: mesh, bounds: item.stroke.bounds))
+                upserts.append(RenderedStroke(id: item.stroke.id, mesh: mesh, bounds: item.stroke.bounds, kind: item.stroke.style.kind))
             }
             return RenderSync(upserts: upserts)
         case .replaced(let index, let original, let fragments):
@@ -406,7 +408,7 @@ nonisolated struct StrokeStore: Sendable {
             let mesh = meshFor(original)
             meshes[original.id] = mesh
             return RenderSync(
-                upserts: [RenderedStroke(id: original.id, mesh: mesh, bounds: original.bounds)],
+                upserts: [RenderedStroke(id: original.id, mesh: mesh, bounds: original.bounds, kind: original.style.kind)],
                 removedIDs: Array(fragIDs)
             )
         case .moved(let ids, let delta):
@@ -431,7 +433,7 @@ nonisolated struct StrokeStore: Sendable {
             grid.insert(id: stroke.id, bounds: stroke.bounds)
             let mesh = meshFor(stroke)
             meshes[stroke.id] = mesh
-            return RenderSync(upserts: [RenderedStroke(id: stroke.id, mesh: mesh, bounds: stroke.bounds)])
+            return RenderSync(upserts: [RenderedStroke(id: stroke.id, mesh: mesh, bounds: stroke.bounds, kind: stroke.style.kind)])
         case .removed(let items):
             let ids = Set(items.map { $0.stroke.id })
             strokes.removeAll { ids.contains($0.id) }
@@ -446,7 +448,7 @@ nonisolated struct StrokeStore: Sendable {
                 grid.insert(id: frag.id, bounds: frag.bounds)
                 let mesh = meshFor(frag)
                 meshes[frag.id] = mesh
-                upserts.append(RenderedStroke(id: frag.id, mesh: mesh, bounds: frag.bounds))
+                upserts.append(RenderedStroke(id: frag.id, mesh: mesh, bounds: frag.bounds, kind: frag.style.kind))
             }
             return RenderSync(upserts: upserts, removedIDs: [original.id])
         case .moved(let ids, let delta):
@@ -501,7 +503,8 @@ nonisolated struct StrokeStore: Sendable {
     private func meshFor(_ stroke: Stroke) -> StrokeMesh {
         if let m = meshes[stroke.id] { return m }
         return StrokeGeometry.tessellate(
-            spine: stroke.spine, color: stroke.style.color, flattenTolerance: currentTolerance
+            spine: stroke.spine, color: stroke.style.color, flattenTolerance: currentTolerance,
+            grain: stroke.style.grain
         )
     }
 

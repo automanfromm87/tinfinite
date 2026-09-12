@@ -185,6 +185,108 @@ do {
     check(dx == 8.5 && dy == 6.0, "uniform delta exact, got (\(dx), \(dy))")
 }
 
+// ---------- 7. 笔刷 nib 响应 ----------
+do {
+    // 硬笔/荧光笔：无视倾斜
+    let pen = StrokeStyle.pen(width: 10)
+    let a = pen.nib(pressure: 0.5, altitude: .pi / 2)
+    let b = pen.nib(pressure: 0.5, altitude: 0)
+    check(approx(a.width, b.width) && a.alpha == 1 && b.alpha == 1, "pen ignores tilt")
+    let hi = StrokeStyle.highlighter()
+    check(hi.kind == .highlighter && hi.nib(pressure: 1).alpha == 1, "highlighter kind + opaque nib")
+    // 钢笔：倾斜收细（垂直全宽，放平约 45%），压力钳制
+    let fp = StrokeStyle.fountainPen(width: 10)
+    let v = fp.nib(pressure: 1, altitude: .pi / 2).width
+    let f = fp.nib(pressure: 1, altitude: 0).width
+    check(approx(v, 10) && approx(f, 4.5), "fountain tilt thins \(v) -> \(f)")
+    check(fp.nib(pressure: -1).width < fp.nib(pressure: 1).width, "fountain pressure clamp")
+    // 铅笔：放平变宽变淡，轻触淡
+    let pc = StrokeStyle.pencil(width: 10)
+    let pv = pc.nib(pressure: 1, altitude: .pi / 2)
+    let pf = pc.nib(pressure: 1, altitude: 0)
+    check(approx(pv.width, 10) && approx(pv.alpha, 1), "pencil vertical full")
+    check(approx(pf.width, 28) && approx(pf.alpha, 0.5), "pencil flat wide+faint")
+    check(pc.nib(pressure: 0, altitude: .pi / 2).alpha < 0.31, "pencil light touch faint")
+    check(pc.grain > 0 && pen.grain == 0, "pencil grain on, pen off")
+}
+
+// ---------- 8. 样式/中线兼容解码 ----------
+do {
+    // 老样式 JSON（无 kind/grain）：不透明 -> pen，半透明 -> highlighter
+    let oldPenJSON = "{\"color\":{\"r\":0,\"g\":0,\"b\":0,\"a\":1},\"baseWidth\":8,\"minWidthScale\":0.12,\"pressureExponent\":0.6}".data(using: .utf8)!
+    let oldPen = try! JSONDecoder().decode(StrokeStyle.self, from: oldPenJSON)
+    check(oldPen.kind == .pen && oldPen.grain == 0, "legacy opaque -> pen")
+    let oldHiJSON = "{\"color\":{\"r\":1,\"g\":0.85,\"b\":0.2,\"a\":0.45},\"baseWidth\":24,\"minWidthScale\":0.85,\"pressureExponent\":1}".data(using: .utf8)!
+    let oldHi = try! JSONDecoder().decode(StrokeStyle.self, from: oldHiJSON)
+    check(oldHi.kind == .highlighter, "legacy translucent -> highlighter")
+    // 新样式往返
+    let rt = try! JSONDecoder().decode(StrokeStyle.self, from: try! JSONEncoder().encode(StrokeStyle.pencil()))
+    check(rt == .pencil(), "style roundtrip")
+    // 老 spine 点（无 alpha）-> 1
+    let oldSpJSON = "{\"x\":1,\"y\":2,\"width\":5}".data(using: .utf8)!
+    let oldSp = try! JSONDecoder().decode(SpinePoint.self, from: oldSpJSON)
+    check(oldSp.alpha == 1, "legacy spine alpha defaults 1")
+}
+
+// ---------- 9. tessellate alpha + 颗粒 ----------
+do {
+    let spine = [
+        SpinePoint(center: CGPoint(x: 0, y: 0), width: 10, alpha: 0.5),
+        SpinePoint(center: CGPoint(x: 40, y: 0), width: 10, alpha: 1),
+    ]
+    // 透明度插值：首顶点 ~0.5a，尾顶点 ~1a
+    let m = StrokeGeometry.tessellate(spine: spine, color: RGBA(r: 0, g: 0, b: 0, a: 0.8))
+    check(!m.vertices.isEmpty, "alpha mesh built")
+    check(abs(m.vertices[0].a - 0.4) < 0.01, "head alpha interpolated, got \(m.vertices[0].a)")
+    // grain=0 时行为与旧版一致：全顶点同 alpha
+    let flat = StrokeGeometry.tessellate(spine: spine.map { SpinePoint(center: $0.center, width: $0.width) }, color: .black)
+    check(Set(flat.vertices.map(\.a)) == [1], "grain off uniform alpha")
+    // grain：确定性（两次一致）+ 真实抖动（不全相等）+ 只降不增
+    let g1 = StrokeGeometry.tessellate(spine: spine, color: .black, grain: 0.35)
+    let g2 = StrokeGeometry.tessellate(spine: spine, color: .black, grain: 0.35)
+    check(g1.vertices.map(\.a) == g2.vertices.map(\.a), "grain deterministic")
+    check(Set(g1.vertices.map(\.a)).count > 1, "grain varies")
+    check(g1.vertices.allSatisfy { $0.a <= 1 }, "grain only darkens")
+    // 点按成点路径也带透明度
+    let dot = StrokeGeometry.tessellate(
+        spine: [SpinePoint(center: CGPoint(x: 5, y: 5), width: 8, alpha: 0.25)], color: .black)
+    check(!dot.vertices.isEmpty && dot.vertices.allSatisfy { abs($0.a - 0.25) < 0.001 }, "dot alpha")
+}
+
+// ---------- 10. 采样器倾斜 ----------
+do {
+    var s = StrokeSampler()
+    s.spacingScreen = 2
+    s.style = .fountainPen(width: 10)
+    s.begin(screen: CGPoint(x: 0, y: 0), pressure: 1, altitude: .pi / 2, azimuth: 0, time: 0)
+    s.append(screen: CGPoint(x: 10, y: 0), pressure: 1, altitude: 0, azimuth: 0, time: 0.01)
+    s.end(screen: CGPoint(x: 20, y: 0), pressure: 1, altitude: 0, azimuth: 0, time: 0.02)
+    let widths = s.spine.map(\.width)
+    check(widths.count >= 2 && widths.first! > widths.last!, "sampler tilt thins fountain")
+    check(s.spine.allSatisfy { $0.alpha == 1 }, "fountain alpha stays 1")
+    check(s.rawPoints.count == 3 && s.rawPoints[1].altitude == 0, "raw keeps tilt")
+
+    var p = StrokeSampler()
+    p.style = .pencil(width: 10)
+    p.begin(screen: CGPoint(x: 0, y: 0), pressure: 1, altitude: 0, azimuth: 0, time: 0)
+    p.end(screen: CGPoint(x: 10, y: 0), pressure: 1, altitude: 0, azimuth: 0, time: 0.01)
+    check(p.spine.allSatisfy { $0.alpha < 1 && $0.width > 10 }, "sampler tilt fades+widens pencil")
+}
+
+// ---------- 11. 渲染分层 ----------
+do {
+    // 荧光笔稳定分区：荧光笔在前保序，其余在后保序
+    let mk: (BrushKind) -> Stroke = { kind in
+        var st = StrokeStyle.pen()
+        st.kind = kind
+        return Stroke(points: [], style: st)
+    }
+    let ordered = [mk(.pen), mk(.highlighter), mk(.pencil), mk(.highlighter)]
+        .highlightersFirst(kindOf: { $0.style.kind })
+        .map(\.style.kind)
+    check(ordered == [.highlighter, .highlighter, .pen, .pencil], "highlighters first stable: \(ordered)")
+}
+
 if failures == 0 { print("ALL DRAWING-MATH TESTS PASSED") }
 else { print("\(failures) FAILURES") }
 exit(failures == 0 ? 0 : 1)

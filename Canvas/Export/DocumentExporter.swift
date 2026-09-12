@@ -59,9 +59,11 @@ nonisolated enum DocumentExporter {
         ctx.setFillColor(cgColor(options.background))
         ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
 
-        // 笔画：三角面片批量填充（同笔一色，整笔一个 path 一次 fill）
+        // 笔画：三角面片批量填充（同笔一色，整笔一个 path 一次 fill）。
+        // 荧光笔先画（与屏幕渲染同层级）；透明度取 spine 平均（倾斜变淡在导出中保留）；
+        // 颗粒纹理不导出（整笔单色 fill，无逐顶点抖动）。
         let tolerance = StrokeGeometry.lodTolerance(forScale: scale, screenError: 0.5)
-        for stroke in doc.strokes {
+        for stroke in doc.strokes.highlightersFirst(kindOf: { $0.style.kind }) {
             let mesh = StrokeGeometry.tessellate(
                 spine: stroke.spine, color: stroke.style.color, flattenTolerance: tolerance
             )
@@ -78,7 +80,12 @@ nonisolated enum DocumentExporter {
                 path.closeSubpath()
                 i += 3
             }
-            ctx.setFillColor(cgColor(stroke.style.color))
+            var flat = stroke.style.color
+            if !stroke.spine.isEmpty {
+                let avg = stroke.spine.reduce(0 as CGFloat) { $0 + $1.alpha } / CGFloat(stroke.spine.count)
+                flat.a *= Float(min(max(avg, 0), 1))
+            }
+            ctx.setFillColor(cgColor(flat))
             ctx.addPath(path)
             ctx.fillPath()
         }

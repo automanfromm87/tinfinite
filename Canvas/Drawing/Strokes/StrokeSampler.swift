@@ -18,6 +18,7 @@ nonisolated struct StrokeSampler {
     private var filter = OneEuroFilter2D()
     private var lastAcceptedScreen: CGPoint?
     private var lastPressure: CGFloat = 0.5
+    private var lastAltitude: CGFloat = .pi / 2
     private var predictedScreen: [CGPoint] = []
 
     /// 原始输入点（世界，未滤波，用于 Stroke 存档/重建）
@@ -25,12 +26,14 @@ nonisolated struct StrokeSampler {
     /// 确认 spine（世界，已滤波+重采样，用于几何）
     private(set) var spine: [SpinePoint] = []
 
-    /// 展示用 spine = 确认 spine + 预测尾巴（预测点用最后压力算宽度）。
+    /// 展示用 spine = 确认 spine + 预测尾巴（预测点用最后压力/倾斜算笔尖）。
     /// 预测点每事件刷新，只影响 live 预览，不进存档。
     var displaySpine: [SpinePoint] {
         guard !predictedScreen.isEmpty else { return spine }
-        let w = style.width(forPressure: lastPressure)
-        return spine + predictedScreen.map { SpinePoint(center: worldConverter($0), width: w) }
+        let nib = style.nib(pressure: lastPressure, altitude: lastAltitude)
+        return spine + predictedScreen.map {
+            SpinePoint(center: worldConverter($0), width: nib.width, alpha: nib.alpha)
+        }
     }
 
     // MARK: - 输入
@@ -38,23 +41,25 @@ nonisolated struct StrokeSampler {
     mutating func begin(screen: CGPoint, pressure: CGFloat, altitude: CGFloat, azimuth: CGFloat, time: TimeInterval) {
         reset()
         lastPressure = pressure
+        lastAltitude = altitude
         let filtered = filter.filter(screen, at: time)
         pushRaw(screen: screen, pressure: pressure, altitude: altitude, azimuth: azimuth, time: time)
-        accept(screen: filtered, pressure: pressure)
+        accept(screen: filtered, pressure: pressure, altitude: altitude)
     }
 
     mutating func append(screen: CGPoint, pressure: CGFloat, altitude: CGFloat, azimuth: CGFloat, time: TimeInterval) {
         lastPressure = pressure
+        lastAltitude = altitude
         pushRaw(screen: screen, pressure: pressure, altitude: altitude, azimuth: azimuth, time: time)
         let filtered = filter.filter(screen, at: time)
         guard let last = lastAcceptedScreen else {
-            accept(screen: filtered, pressure: pressure)
+            accept(screen: filtered, pressure: pressure, altitude: altitude)
             return
         }
         let dx = filtered.x - last.x
         let dy = filtered.y - last.y
         if dx * dx + dy * dy >= spacingScreen * spacingScreen {
-            accept(screen: filtered, pressure: pressure)
+            accept(screen: filtered, pressure: pressure, altitude: altitude)
         }
     }
 
@@ -66,16 +71,17 @@ nonisolated struct StrokeSampler {
     /// 结束：终点强制接受（保证落笔 exactly 到抬笔位置），清预测。
     mutating func end(screen: CGPoint, pressure: CGFloat, altitude: CGFloat, azimuth: CGFloat, time: TimeInterval) {
         lastPressure = pressure
+        lastAltitude = altitude
         pushRaw(screen: screen, pressure: pressure, altitude: altitude, azimuth: azimuth, time: time)
         // 终点用原始位置（不滤波），落笔精确
         if let last = lastAcceptedScreen {
             let dx = screen.x - last.x
             let dy = screen.y - last.y
             if dx * dx + dy * dy >= (spacingScreen * 0.25) * (spacingScreen * 0.25) || spine.isEmpty {
-                accept(screen: screen, pressure: pressure)
+                accept(screen: screen, pressure: pressure, altitude: altitude)
             }
         } else {
-            accept(screen: screen, pressure: pressure)
+            accept(screen: screen, pressure: pressure, altitude: altitude)
         }
         predictedScreen = []
     }
@@ -84,6 +90,7 @@ nonisolated struct StrokeSampler {
         filter.reset()
         lastAcceptedScreen = nil
         lastPressure = 0.5
+        lastAltitude = .pi / 2
         predictedScreen = []
         rawPoints = []
         spine = []
@@ -98,11 +105,12 @@ nonisolated struct StrokeSampler {
         ))
     }
 
-    private mutating func accept(screen: CGPoint, pressure: CGFloat) {
+    private mutating func accept(screen: CGPoint, pressure: CGFloat, altitude: CGFloat) {
         lastAcceptedScreen = screen
+        let nib = style.nib(pressure: pressure, altitude: altitude)
         spine.append(SpinePoint(
             center: worldConverter(screen),
-            width: style.width(forPressure: pressure)
+            width: nib.width, alpha: nib.alpha
         ))
     }
 }
