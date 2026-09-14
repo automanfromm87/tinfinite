@@ -5,30 +5,59 @@ import UIKit
 
 final class SelectionOverlayView: UIView {
 
+    /// 橡皮光标（世界圆）
+    struct EraserCursor: Equatable {
+        var center: CGPoint
+        var radius: CGFloat
+    }
+
+    /// 套索首尾点（世界坐标）
+    struct LassoEnds: Equatable {
+        var start: CGPoint
+        var current: CGPoint
+    }
+
     /// 选中范围（世界坐标），nil = 无选择
     var worldRect: CGRect? {
         didSet {
             guard worldRect != oldValue else { return }
-            setNeedsDisplay()
+            invalidate()
         }
     }
 
-    /// 橡皮光标（世界圆），nil = 不显示
-    var eraserCursor: (center: CGPoint, radius: CGFloat)? {
-        didSet { setNeedsDisplay() }
+    /// 橡皮光标（世界圆），nil = 不显示。
+    /// 相等守卫不是可有可无的：画笔每个输入事件都会把它和 lassoEnds 置 nil
+    /// （clearDragHints），没有守卫就等于每帧把一个全屏（12.9" 下 22MB）
+    /// 非透明底的 CoreGraphics backing store 作废重画一遍，而 draw(_:) 其实什么都没画。
+    var eraserCursor: EraserCursor? {
+        didSet {
+            guard eraserCursor != oldValue else { return }
+            invalidate()
+        }
     }
 
     /// 套索首尾点（世界坐标）：两点屏幕距离近时画闭合提示虚线
-    var lassoEnds: (start: CGPoint, current: CGPoint)? {
-        didSet { setNeedsDisplay() }
+    var lassoEnds: LassoEnds? {
+        didSet {
+            guard lassoEnds != oldValue else { return }
+            invalidate()
+        }
     }
 
     /// 当前视口（UIKit 直驱）
     var viewport: Viewport = .zero {
         didSet {
-            guard viewport != oldValue else { return }
+            guard viewport != oldValue, !isHidden else { return }
             setNeedsDisplay()
         }
+    }
+
+    /// 三个内容源都空时整层隐藏：隐藏图层不分配 backing store，也不参与合成。
+    /// 画笔期间（最常见的情形）这一层因此完全从渲染树里消失。
+    private func invalidate() {
+        let empty = worldRect == nil && eraserCursor == nil && lassoEnds == nil
+        if isHidden != empty { isHidden = empty }
+        if !empty { setNeedsDisplay() }
     }
 
     var accentColor: UIColor = .systemBlue
@@ -47,6 +76,7 @@ final class SelectionOverlayView: UIView {
         backgroundColor = .clear
         isUserInteractionEnabled = false
         contentMode = .redraw
+        isHidden = true   // 无选择/无提示时不存在于渲染树
     }
 
     override func draw(_ rect: CGRect) {

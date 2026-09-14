@@ -231,7 +231,10 @@ struct CanvasDetailView: View {
         .onChange(of: model.camera) { _, _ in persistCameraDebounced() }
         .onDisappear {
             cameraSaveTask?.cancel()
+            refs.controller?.flushAutosave()
             library.updateCamera(id: documentID, camera: model.camera)
+            // 列表里马上要看到这张画布了，把节流中的缩略图刷新兑现掉
+            library.refreshThumbnails()
         }
         // 切后台：先立刻触发待定的笔画/相机存档（不等防抖），再等后台队列排干。
         // beginBackgroundTask 保证 suspend 前写完，否则最后一笔可能丢失。
@@ -241,6 +244,7 @@ struct CanvasDetailView: View {
             cameraSaveTask?.cancel()
             refs.controller?.flushAutosave()
             library.updateCamera(id: documentID, camera: model.camera)
+            library.refreshThumbnails()
             let lib = library
             Task { @MainActor in
                 let taskID = UIApplication.shared.beginBackgroundTask(withName: "canvas-flush") {}

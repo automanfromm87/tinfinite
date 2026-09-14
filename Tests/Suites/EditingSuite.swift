@@ -1118,6 +1118,54 @@ do {
     check(content.nodes.count == 5, "oldest 5 content nodes dropped, kept \(content.nodes.count)")
 }
 
+// ---------- 撤销水位（跨域账本的记账基元） ----------
+
+// 回归：栈满之后 undoDepth 不再变化，只看深度会漏记每一次变更，
+// 于是跨域撤销账本从第 101 笔起把「撤销」派发到错误的域。
+do {
+    var store = StrokeStore()
+    var missedByDepth = 0
+    var missedBySeq = 0
+    var evictedTotal = 0
+    for i in 0..<(StrokeStore.maxUndoDepth + 40) {
+        let depthBefore = store.undoDepth
+        let markBefore = store.undoMark
+        addLine(&store, x0: 0, x1: 10, y: CGFloat(i), n: 3)
+        if store.undoDepth == depthBefore { missedByDepth += 1 }
+        if store.undoMark.seq == markBefore.seq { missedBySeq += 1 }
+        evictedTotal += store.undoMark.discarded - markBefore.discarded
+    }
+    check(missedByDepth == 40, "depth-based accounting misses \(missedByDepth) mutations after saturation")
+    check(missedBySeq == 0, "seq-based accounting never misses a mutation")
+    check(evictedTotal == 40, "eviction count reported exactly, got \(evictedTotal)")
+    check(store.undoMark.seq == StrokeStore.maxUndoDepth + 40, "seq counts every push")
+
+    // 空操作不得推进序号（否则账本会记一条撤不动的条目）
+    let before = store.undoMark
+    _ = store.commitMoveSelection(by: CGSize(width: 0, height: 0))
+    check(store.undoMark == before, "no-op move does not advance mark")
+}
+
+do {
+    var content = ContentStore()
+    var missedBySeq = 0
+    for i in 0..<(ContentStore.maxUndoDepth + 10) {
+        let markBefore = content.undoMark
+        content.add(ContentNode(kind: .shape(.rectangle), frame: CGRect(x: CGFloat(i), y: 0, width: 10, height: 10)))
+        if content.undoMark.seq == markBefore.seq { missedBySeq += 1 }
+    }
+    check(missedBySeq == 0, "content seq accounting never misses")
+    check(content.undoMark.discarded == 10, "content eviction counted, got \(content.undoMark.discarded)")
+    // 连续输入合并成一步：序号只能前进一次
+    let node = ContentNode(kind: .text, frame: CGRect(x: 0, y: 0, width: 10, height: 10))
+    content.add(node)
+    let typingStart = content.undoMark
+    content.setText(id: node.id, text: "a")
+    content.setText(id: node.id, text: "ab")
+    content.setText(id: node.id, text: "abc")
+    check(content.undoMark.seq == typingStart.seq + 1, "merged typing advances mark once")
+}
+
 // ---------- 手掌判定 ----------
 
 do {

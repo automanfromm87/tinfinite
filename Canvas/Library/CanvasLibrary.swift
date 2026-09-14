@@ -69,6 +69,17 @@ final class CanvasLibrary: ObservableObject {
     /// 文档（按更新时间倒序；冷启动时只含 manifest 壳，笔画按需加载）
     @Published private(set) var documents: [CanvasDocument] = []
 
+    /// 缩略图刷新代号：内容变化时最多每 `thumbnailThrottle` 秒 +1。
+    /// 侧边栏缩略图以它为 task id，避免每次自动存档（写字时 ~1/s）都重栅格化。
+    @Published private(set) var thumbnailRevision = 0
+    private var lastThumbnailBump = Date.distantPast
+    private var thumbnailBumpPending = false
+    private var thumbnailTrailingWork: DispatchWorkItem?
+    private static let thumbnailThrottle: TimeInterval = 5
+
+    /// 节点图片所在的文档目录（导出等后台任务用；URL 是 Sendable，可跨线程）
+    var imagesSourceDirectory: URL { directory }
+
     private let directory: URL
     private let legacyURL: URL?
     /// IO 串行队列：diff + JSON 编码 + 文件写 + 基准提交全部在这里。
@@ -249,21 +260,68 @@ final class CanvasLibrary: ObservableObject {
         updateContent(id: id, strokes: strokes, nodes: document(id: id)?.nodes ?? [])
     }
 
-    /// 更新某文档的笔画 + 节点（自动存档入口）：刷新缓存 + 写盘 + 置顶
+    /// 更新某文档的笔画 + 节点（自动存档入口）：刷新缓存 + 写盘 + 置顶。
+    ///
+    /// 性能约束（写字热路径）：本方法在每次自动存档时被调用，而 `documents` 是
+    /// @Published —— 每次赋值都会让整个侧边栏 + 详情页 body 重算。所以：
+    /// - 只发布 **一次**（先在局部数组上改完，最后整体赋值），而不是逐字段 7 次；
+    /// - 绝不把 live 笔画数组塞进已发布的壳里（笔画真相在非发布的 strokesCache），
+    ///   否则每次发布都会让缩略图拿到新数据并重栅格化全部笔画中线。
     func updateContent(id: UUID, strokes: [Stroke], nodes: [ContentNode]) {
         guard let index = documents.firstIndex(where: { $0.meta.id == id }) else { return }
-        documents[index].strokes = strokes
-        documents[index].nodes = nodes
-        documents[index].strokesLoaded = true
-        documents[index].manifestStrokeCount = nil
-        documents[index].meta.updatedAt = Date()
+        // 缓存先行：save(id:) -> document(id:) 走缓存分支，零 IO
         strokesCache[id] = strokes
         strokeCounts[id] = strokes.count + (unreadableCache[id]?.count ?? 0)
-        let doc = documents[index]
+
+        var doc = documents[index]
+        doc.strokes = []                              // 壳不带笔画，strokesCache 才是真相
+        doc.strokesLoaded = false
+        doc.manifestStrokeCount = strokeCounts[id]
+        doc.nodes = nodes                             // delete(id:) 仍需节点的 imageFile
+        doc.meta.updatedAt = Date()                   // reload() 按它倒序，必须保留
+
+        var next = documents
+        next.remove(at: index)
+        next.insert(doc, at: 0)                       // 最近更新优先
+        documents = next                              // 唯一一次 objectWillChange
+
         save(id: id)
-        // 移到最前（最近更新优先）
-        documents.remove(at: index)
-        documents.insert(doc, at: 0)
+        bumpThumbnailRevisionThrottled()
+    }
+
+    /// 缩略图代号节流推进（写字期间最多每 5 秒一次重栅格化）。
+    /// 带 trailing 补发：被节流吃掉的那一次会在空闲后补上，否则「最后一笔」
+    /// 的缩略图在用户不离开画布时永远不会刷新（iPad 上侧边栏是常驻的）。
+    private func bumpThumbnailRevisionThrottled() {
+        let now = Date()
+        guard now.timeIntervalSince(lastThumbnailBump) > Self.thumbnailThrottle else {
+            thumbnailBumpPending = true
+            scheduleTrailingThumbnailBump()
+            return
+        }
+        lastThumbnailBump = now
+        thumbnailBumpPending = false
+        thumbnailRevision &+= 1
+    }
+
+    private func scheduleTrailingThumbnailBump() {
+        thumbnailTrailingWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.refreshThumbnails() }
+        thumbnailTrailingWork = work
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.thumbnailThrottle, execute: work
+        )
+    }
+
+    /// 兑现被节流吃掉的缩略图刷新（离开画布 / 切后台时调）。
+    /// 没有欠账就什么都不做——不做无谓的发布。
+    func refreshThumbnails() {
+        thumbnailTrailingWork?.cancel()
+        thumbnailTrailingWork = nil
+        guard thumbnailBumpPending else { return }
+        lastThumbnailBump = Date()
+        thumbnailBumpPending = false
+        thumbnailRevision &+= 1
     }
 
     func rename(id: UUID, title: String) {

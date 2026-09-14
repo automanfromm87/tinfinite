@@ -339,7 +339,7 @@ nonisolated struct RenderedStroke: Sendable {
 
 extension Array {
     /// 稳定分区：荧光笔在前、其余在后（各自分区内保序），导出/渲染层级用
-    func highlightersFirst(kindOf: (Element) -> BrushKind) -> [Element] {
+    nonisolated func highlightersFirst(kindOf: (Element) -> BrushKind) -> [Element] {
         let (hi, rest) = (filter { kindOf($0) == .highlighter }, filter { kindOf($0) != .highlighter })
         return hi + rest
     }

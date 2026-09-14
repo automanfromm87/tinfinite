@@ -55,8 +55,20 @@ final class CanvasGridView: UIView {
         commonInit()
     }
 
+    /// 纸张底色：本视图不透明时自己铺底（省掉一层全屏透明合成）
+    var paperColor: UIColor = .systemBackground {
+        didSet {
+            guard paperColor != oldValue else { return }
+            backgroundColor = paperColor
+            setNeedsDisplay()
+        }
+    }
+
     private func commonInit() {
-        backgroundColor = .clear
+        // 不透明层：CoreGraphics 不必把 22MB 背板清成透明，渲染服务器也能
+        // 直接跳过它下面的所有内容。网格自己铺纸张底色来维持视觉不变。
+        isOpaque = true
+        backgroundColor = paperColor
         isUserInteractionEnabled = false
         contentMode = .redraw
     }
@@ -64,6 +76,9 @@ final class CanvasGridView: UIView {
     override func draw(_ rect: CGRect) {
         guard let ctx = UIGraphicsGetCurrentContext() else { return }
         let vp = viewport
+        // 不透明层必须自己填满，否则会露出上一帧的残留
+        ctx.setFillColor(paperColor.cgColor)
+        ctx.fill(bounds)
         guard vp.size.width > 0, vp.size.height > 0, vp.scale > 0 else { return }
 
         let visible = vp.visibleWorldRect
@@ -85,6 +100,9 @@ final class CanvasGridView: UIView {
             )
         } else {
             ctx.setLineWidth(1.0 / contentScaleFactor)
+            // 格线坐标已经 snap 到物理像素（见 snap(_:)），抗锯齿只会把
+            // 一条 1px 硬线摊成两行半透明像素：既更糊又贵。轴线之后单独开回来。
+            ctx.setShouldAntialias(false)
 
             // 只遍历可见范围内的格线
             drawLines(
@@ -95,6 +113,7 @@ final class CanvasGridView: UIView {
                 ctx: ctx, viewport: vp, visible: visible, step: majorStep,
                 color: major, skipMultipleOf: 0
             )
+            ctx.setShouldAntialias(true)
         }
         drawAxes(ctx: ctx, viewport: vp, visible: visible)
     }

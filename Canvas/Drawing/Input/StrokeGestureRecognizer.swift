@@ -4,7 +4,10 @@
 // 每次 .changed 携带 coalesced（补点，还原 240Hz 轨迹）+ predicted（降延迟预览）。
 //
 // 与 pan 的竞速规则（画笔模式单指画线、双指平移的关键）：
-// - touch-down 不立即 began：等挪动超过 beginSlop 才开始，给双指 pan 留出获胜窗口；
+// - 笔：零 slop，接触即 began（落笔到出墨之间不留死区），并声明可与画布的
+//   pan/pinch/点按并发，避免笔尖只是搁着就把整个手势竞技场独占掉；
+// - 手指/指针：touch-down 不立即 began，等挪动超过 beginSlop 才开始，
+//   给双指 pan 留出获胜窗口；
 // - 一旦出现第 2 根允许类型的触摸且本手势还在 possible，直接自败（.failed），pan 接管；
 // - 已经 began 后再落第二指则忽略（笔画继续，不中途打断）。
 // 注意只数允许类型的触摸：笔模式下手指 rests 不会导致笔触自败。
@@ -21,24 +24,43 @@ final class StrokeGestureRecognizer: UIGestureRecognizer {
     /// 最近一次 move 的 predicted 触摸
     private(set) var pendingPredicted: [UITouch] = []
 
-    /// 延迟识别阈值（点）：down 后挪动超过它才 began（点按不足阈值则按点处理）
+    /// 延迟识别阈值（点）：down 后挪动超过它才 began（点按不足阈值则按点处理）。
+    /// 只对手指/指针生效——笔在任何模式下都没有单指竞争者（画笔模式 pan 只收 .direct，
+    /// 手指模式 pan 要两指，pinch/撤销点按更要 2~3 指），等 slop 纯粹是白白增加落笔延迟。
     private let beginSlop: CGFloat = 3
     private var downLocation: CGPoint = .zero
     private var hasDownLocation = false
 
+    /// 真实接触点（view 坐标）与时刻：slop 期间被吃掉的笔画头由调用方据此补回
+    private(set) var downSampleLocation: CGPoint?
+    private(set) var downSampleTime: TimeInterval = 0
+
     override init(target: Any?, action: Selector?) {
         super.init(target: target, action: action)
         cancelsTouchesInView = false
+        // 与画布自己的 pan/pinch/点按识别器共存。
+        // 必须显式允许：笔是零 slop 的，接触即 .began，而一个已 began 的连续识别器
+        // 会把共享同一触摸、又没声明可并发的识别器全部 prevent 掉 —— 笔尖只是搁在
+        // 屏幕上时，捏合缩放/双指撤销就再也不会触发了。
+        // 真正「不让画布动」的保护不在这里，而在 DrawingController：位移越过阈值
+        // 确认在作画后，才关掉 pan/zoom（见 freezeCanvasIfDragging）。
+        delegate = self
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
         super.touchesBegan(touches, with: event)
-        guard state == .possible, trackedTouch == nil else { return }
+        guard state == .possible else { return }
+        // 第 2 根允许类型的触摸落下就自败——必须在 trackedTouch 判空**之前**，
+        // 否则已经跟踪第一根手指后这条规则永远不会执行：双指点按时第一根若不动，
+        // 抬手时会补发 .began/.ended 提交一个幽灵墨点，并吃掉双指撤销手势。
         if liveAllowedTouches(event).count > 1 {
+            trackedTouch = nil
             state = .failed
             return
         }
-        guard let touch = touches.first(where: { isTouchAllowed($0) && !isPalm($0) }) else {
+        guard trackedTouch == nil,
+              let touch = touches.first(where: { isTouchAllowed($0) && !isPalm($0) })
+        else {
             // 没有允许类型的触摸：这次序列与我无关（保持 possible，让别人识别）
             return
         }
@@ -46,6 +68,19 @@ final class StrokeGestureRecognizer: UIGestureRecognizer {
         if let v = view {
             downLocation = touch.location(in: v)
             hasDownLocation = true
+            if touch.type == .pencil {
+                // 笔：零 slop，接触即 began。落笔到第一像素墨迹的死区由此消失。
+                // 不设 downSampleLocation —— 这一批 coalesced 点本身就从接触点开始，
+                // 而 `touch` 是其中最新的一个，补到队首会造一个「新->旧」的回钩。
+                pendingCoalesced = coalesced(for: touch, event: event)
+                pendingPredicted = event.predictedTouches(for: touch) ?? []
+                state = .began
+            } else {
+                // 手指/指针仍要等 beginSlop 让位给双指平移；真实接触点先存下来，
+                // began 时补回队首，否则笔画头会整体偏移 slop 距离。
+                downSampleLocation = downLocation
+                downSampleTime = touch.timestamp
+            }
         }
     }
 
@@ -100,6 +135,8 @@ final class StrokeGestureRecognizer: UIGestureRecognizer {
         pendingCoalesced = []
         pendingPredicted = []
         hasDownLocation = false
+        downSampleLocation = nil
+        downSampleTime = 0
     }
 
     // MARK: - 内部
@@ -128,5 +165,18 @@ final class StrokeGestureRecognizer: UIGestureRecognizer {
 
     private func coalesced(for touch: UITouch, event: UIEvent) -> [UITouch] {
         event.coalescedTouches(for: touch) ?? [touch]
+    }
+}
+
+// MARK: - 并发识别
+
+extension StrokeGestureRecognizer: UIGestureRecognizerDelegate {
+    /// 允许与画布的任何识别器并发。落笔不再独占手势竞技场：
+    /// 画布该不该动由 DrawingController 的冻结逻辑决定，而不是由「谁先 began」决定。
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        true
     }
 }

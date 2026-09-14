@@ -10,6 +10,15 @@ struct CanvasSidebar: View {
     @State private var renamingID: UUID?
     @State private var renameText = ""
     @State private var query = ""
+    @State private var exportRequest: ExportRequest?
+    @State private var exporting = false
+
+    /// 导出结果（sheet(item:) 要求 Identifiable；URL 本身不是）
+    private struct ExportRequest: Identifiable {
+        let id: UUID
+        let title: String
+        let url: URL
+    }
 
     var body: some View {
         Group {
@@ -48,10 +57,17 @@ struct CanvasSidebar: View {
                         .buttonStyle(.plain)
                         .accessibilityIdentifier("documentRow")
                         .listRowBackground(selection == doc.meta.id ? Color.accentColor.opacity(0.12) : nil)
+                        // 菜单构建器是「急切求值」的：SwiftUI 在每次 row body 求值时就会
+                        // 运行这个闭包（非逃逸 @ViewBuilder），所以这里绝不能做任何重活。
+                        // 旧版在此直接渲染整幅 PNG，导致每次自动存档（写字期间 ~0.5s 一次）
+                        // 都在主线程跑一遍 tessellate + 2048px 位图 + PNG 编码 + 临时文件写。
                         .contextMenu {
                             Button("重命名") { beginRename(doc) }
-                            if let url = pngExportURL(for: doc) {
-                                ShareLink(item: url, preview: SharePreview(doc.meta.title, image: url)) {
+                            // O(1) 字典查表，无 IO
+                            if library.strokeCount(id: doc.meta.id) > 0 || !doc.nodes.isEmpty {
+                                Button {
+                                    startExport(doc)
+                                } label: {
                                     Label("导出 PNG", systemImage: "square.and.arrow.up")
                                 }
                             }
@@ -82,6 +98,13 @@ struct CanvasSidebar: View {
                 }
             }
         }
+        .sheet(item: $exportRequest) { request in
+            ShareLink(item: request.url, preview: SharePreview(request.title, image: request.url)) {
+                Label("分享 \(request.title).png", systemImage: "square.and.arrow.up")
+                    .padding()
+            }
+            .presentationDetents([.height(160)])
+        }
     }
 
     // MARK: - 内部
@@ -100,20 +123,37 @@ struct CanvasSidebar: View {
         "\(doc.meta.updatedAt.formatted(date: .numeric, time: .shortened)) · \(library.strokeCount(id: doc.meta.id)) 笔 · \(doc.nodes.count) 节点"
     }
 
-    /// 导出 PNG 到临时文件（菜单打开时才生成一次；空文档返回 nil，不显示入口）
-    private func pngExportURL(for doc: CanvasDocument) -> URL? {
-        // resolve 经缓存/读盘取全量笔画（菜单 action 上下文，非 body，同步读安全）
-        guard let full = library.document(id: doc.meta.id),
-              let data = DocumentExporter.pngData(for: full, imageData: { library.imageData(file: $0) })
-        else { return nil }
+    /// 导出 PNG：只在用户真正点了菜单项时才做，且渲染/编码/落盘全在后台线程。
+    /// 笔画先经 library 的后台读盘 API 预热缓存，避免主线程同步解码整档。
+    private func startExport(_ doc: CanvasDocument) {
+        guard !exporting else { return }
+        exporting = true
+        let id = doc.meta.id
         let safeTitle = doc.meta.title.replacingOccurrences(of: "/", with: "-")
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("\(safeTitle)-\(doc.meta.id.uuidString.prefix(8)).png")
-        do {
-            try data.write(to: url, options: .atomic)
-            return url
-        } catch {
-            return nil
+        Task { @MainActor in
+            defer { exporting = false }
+            _ = await library.strokes(for: id)          // 后台读盘 + 填缓存
+            guard let full = library.document(id: id) else { return }  // 现在恒为缓存命中
+            let dir = library.imagesSourceDirectory
+            let url = await Task.detached(priority: .userInitiated) { () -> URL? in
+                guard let data = DocumentExporter.pngData(
+                    for: full,
+                    imageData: { DrawingStore.loadImageData(file: $0, beside: dir) }
+                ) else { return nil }
+                // 专用子目录：每次导出前清空，临时 PNG 不会无限堆积
+                let exportDir = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("CanvasExport", isDirectory: true)
+                try? FileManager.default.removeItem(at: exportDir)
+                guard (try? FileManager.default.createDirectory(
+                    at: exportDir, withIntermediateDirectories: true
+                )) != nil else { return nil }
+                let out = exportDir.appendingPathComponent("\(safeTitle).png")
+                guard (try? data.write(to: out, options: .atomic)) != nil else { return nil }
+                return out
+            }.value
+            if let url {
+                exportRequest = ExportRequest(id: id, title: safeTitle, url: url)
+            }
         }
     }
 

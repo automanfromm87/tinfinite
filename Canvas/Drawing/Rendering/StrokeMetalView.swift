@@ -61,10 +61,11 @@ final class StrokeMetalView: MTKView, MTKViewDelegate {
             guard let mesh = meshes[id], !mesh.isEmpty,
                   let range = ranges[id]
             else { continue }
-            copyVertices(mesh.vertices, into: vertexBuffer, atVertex: range.vertexOffset)
+            copyVertices(mesh.vertices[...], into: vertexBuffer, atVertex: range.vertexOffset)
         }
-        if !liveVerticesCache.isEmpty {
-            copyVertices(liveVerticesCache, into: liveVertexBuffer, atVertex: 0)
+        if liveIndexCount > 0 {
+            liveNeedsFullUpload = true
+            onLiveReuploadNeeded?()
         }
     }
 
@@ -76,6 +77,9 @@ final class StrokeMetalView: MTKView, MTKViewDelegate {
     // MARK: - 已提交笔画缓冲（共享，append-only）
 
     private var order: [UUID] = []
+    /// order 的集合镜像：upsert 的存在性判断必须 O(1)。
+    /// 原来的 `order.contains(id)` 在 LOD 批量重建时是 O(N²)（10k 笔实测 142ms）。
+    private var orderSet: Set<UUID> = []
     private var meshes: [UUID: StrokeMesh] = [:]
     private var boundsMap: [UUID: CGRect] = [:]
     private var ranges: [UUID: IndexRange] = [:]
@@ -87,6 +91,29 @@ final class StrokeMetalView: MTKView, MTKViewDelegate {
         var indexOffset: Int   // 以索引为单位
         var indexCount: Int
     }
+
+    // MARK: - 绘制列表（按笔刷层级预分区的稠密数组）
+
+    /// 一条 draw 记录。draw(in:) 每帧遍历它，**不碰任何 Dictionary**：
+    /// 原来每笔每帧要做 4 次 UUID 哈希（16 字节 SipHash + 大概率 L2 miss），
+    /// 10k 笔时 ~1.5ms/帧只花在查表上。换成稠密数组后同样规模 ~0.024ms。
+    private struct DrawItem {
+        var vertexOffset: Int
+        var indexOffset: Int
+        var indexCount: Int
+        /// 世界包围盒（预拆成标量，避免每帧 CGRect 的 C 调用）；minX > maxX 表示「无 bounds，恒绘制」
+        var minX: CGFloat
+        var minY: CGFloat
+        var maxX: CGFloat
+        var maxY: CGFloat
+    }
+
+    /// 荧光笔在前（画在墨线下），各自保持 z 序
+    private var highlighterItems: [DrawItem] = []
+    private var inkItems: [DrawItem] = []
+    /// id -> 它在哪张表的第几位（只在 drawList 有效时可用），用于原地改包围盒
+    private var drawSlot: [UUID: (highlighter: Bool, index: Int)] = [:]
+    private var drawListDirty = true
 
     private var vertexBuffer: MTLBuffer?
     private var indexBuffer: MTLBuffer?
@@ -117,8 +144,14 @@ final class StrokeMetalView: MTKView, MTKViewDelegate {
     private var liveIndexCount = 0
     /// live 笔刷种类（荧光笔 live 先画，避免提交时从上层“掉”到底层造成闪烁）
     private var liveKind: BrushKind = .pen
-    /// live 顶点 CPU 侧缓存（绝对坐标；rebase 时重传用）
-    private var liveVerticesCache: [StrokeVertex] = []
+    /// 下次 live 更新必须整段重传（renderOrigin 变了）。
+    ///
+    /// 这里刻意 **不缓存** live 顶点数组：那会让 LiveStrokeMesh 内部数组的引用计数
+    /// 变成 2，它下一次 append/removeLast 就触发整数组 CoW 深拷贝 —— 正好把增量
+    /// 镶嵌省下来的 O(n) 又原样加回去。改为置位 + 回调上层重推一次。
+    private var liveNeedsFullUpload = false
+    /// renderOrigin 变化后请求上层重推 live 网格
+    var onLiveReuploadNeeded: (() -> Void)?
 
     // MARK: - Init
 
@@ -209,41 +242,87 @@ final class StrokeMetalView: MTKView, MTKViewDelegate {
             ranges.removeValue(forKey: id)
             kindMap.removeValue(forKey: id)
         }
-        if !removed.isEmpty {
-            order.removeAll { removed.contains($0) }
-        }
+
+        // 空洞先整理再 append：重开文档时能复用删除释放出的空间，
+        // 否则上次因缓冲满被丢掉的笔这次仍然进不来。
+        order = newIDs
+        orderSet = newSet
+        maybeCompact()
 
         // 新增：append 到 buffer 尾
+        var dropped = 0
         for s in strokes {
             kindMap[s.id] = s.kind
             guard !oldSet.contains(s.id) || ranges[s.id] == nil else { continue }
-            guard appendMesh(s.mesh, id: s.id) else { continue }
             meshes[s.id] = s.mesh
             boundsMap[s.id] = s.bounds
+            if !appendMesh(s.mesh, id: s.id) { dropped += 1 }
         }
-        order = newIDs
+        if dropped > 0 { onBufferFull?(dropped) }
         maybeCompact()
+        drawListDirty = true
         setNeedsDisplay()
     }
 
+    /// 缓冲写满、笔画无法上屏时的通知（调用方决定怎么告诉用户；默认只有 console 警告）
+    var onBufferFull: ((Int) -> Void)?
+
     /// 增量 upsert 一笔（新增 append、已存在替换为新区段）。LOD/碎片/撤销恢复用。
     func upsertMesh(id: UUID, mesh: StrokeMesh, bounds: CGRect, kind: BrushKind = .pen) {
-        if let range = ranges[id] {
-            holeVertices += meshes[id]?.vertices.count ?? 0
-            holeIndices += range.indexCount
+        upsertMeshes([RenderedStroke(id: id, mesh: mesh, bounds: bounds, kind: kind)])
+    }
+
+    /// 批量 upsert（LOD 扫描/局部擦除用）：一次容量核算 + 至多一次全量重排，
+    /// 而不是逐笔 append-记空洞-可能触发 compact 的 k 次循环。
+    func upsertMeshes(_ rawItems: [RenderedStroke]) {
+        guard !rawItems.isEmpty else { return }
+        // 同一批里出现同一个 id 时只保留最后一份：append 路径靠 ranges[id] 判重，
+        // 重复 id 的第二份几何会被判成「重排已放好」而静默丢弃。
+        var items = rawItems
+        if items.count > 1 {
+            var lastIndex: [UUID: Int] = [:]
+            lastIndex.reserveCapacity(items.count)
+            for (i, it) in items.enumerated() { lastIndex[it.id] = i }
+            if lastIndex.count != items.count {
+                items = items.enumerated().compactMap { lastIndex[$1.id] == $0 ? $1 : nil }
+            }
         }
-        meshes[id] = mesh
-        boundsMap[id] = bounds
-        kindMap[id] = kind
-        if !mesh.isEmpty {
-            appendMesh(mesh, id: id)
+        var replacedAny = false
+        for it in items {
+            if let range = ranges[it.id] {
+                holeVertices += meshes[it.id]?.vertices.count ?? 0
+                holeIndices += range.indexCount
+                ranges.removeValue(forKey: it.id)
+                replacedAny = true
+            }
+            meshes[it.id] = it.mesh
+            boundsMap[it.id] = it.bounds
+            kindMap[it.id] = it.kind
+            if orderSet.insert(it.id).inserted {
+                order.append(it.id)
+            }
+        }
+        if items.count > 1 && replacedAny {
+            // 批量替换：所有被替换的区段都成了空洞，直接一次线性重排最省
+            rebuildBuffers()
+            drawListDirty = true
         } else {
-            ranges.removeValue(forKey: id)
+            let wasClean = !drawListDirty
+            var dropped = 0
+            for it in items where !it.mesh.isEmpty {
+                if !appendMesh(it.mesh, id: it.id) { dropped += 1 }
+            }
+            if dropped > 0 { onBufferFull?(dropped) }
+            maybeCompact()   // 可能整体重排，会自行置脏
+            // 提交一笔是最高频的路径：没有发生重排/扩容时直接往绘制表尾部追加一条，
+            // 避免每落一笔都 O(已提交笔画数) 地重建整张表。
+            if wasClean, !drawListDirty, dropped == 0, items.count == 1,
+               let range = ranges[items[0].id], range.indexCount > 0, drawSlot[items[0].id] == nil {
+                appendDrawItem(id: items[0].id, range: range)
+            } else {
+                drawListDirty = true
+            }
         }
-        if !order.contains(id) {
-            order.append(id)
-        }
-        maybeCompact()
         setNeedsDisplay()
     }
 
@@ -253,10 +332,14 @@ final class StrokeMetalView: MTKView, MTKViewDelegate {
         let set = Set(ids)
         var changed = false
         for id in set {
-            guard ranges[id] != nil else { continue }
+            // 没有 range 也要清干净（缓冲曾写满、或 mesh 为空的笔画）：
+            // 只 continue 会把 meshes/order 里的残留留下，之后一次 compact()
+            // 就会把这条「已删除」的笔画重新写回缓冲，死而复生。
             if let range = ranges[id] {
                 holeVertices += meshes[id]?.vertices.count ?? 0
                 holeIndices += range.indexCount
+            } else if !orderSet.contains(id) && meshes[id] == nil {
+                continue
             }
             meshes.removeValue(forKey: id)
             boundsMap.removeValue(forKey: id)
@@ -266,7 +349,9 @@ final class StrokeMetalView: MTKView, MTKViewDelegate {
         }
         if changed {
             order.removeAll { set.contains($0) }
+            orderSet.subtract(set)
             maybeCompact()
+            drawListDirty = true
             setNeedsDisplay()
         }
     }
@@ -280,33 +365,94 @@ final class StrokeMetalView: MTKView, MTKViewDelegate {
         else { return }
         meshes[id] = mesh
         boundsMap[id] = bounds
-        copyVertices(mesh.vertices, into: vertexBuffer, atVertex: range.vertexOffset)
-        copyIndices(mesh.indices, into: indexBuffer, atIndex: range.indexOffset)
+        copyVertices(mesh.vertices[...], into: vertexBuffer, atVertex: range.vertexOffset)
+        copyIndices(mesh.indices[...], into: indexBuffer, atIndex: range.indexOffset)
+        // bounds 变了，绘制列表里的裁剪盒要跟着更新——但只改一个格子就够，
+        // 整表重建会让「拖动选中笔画」每帧都付一次 O(已提交笔画数)。
+        if !patchDrawItemBounds(id: id, bounds: bounds) {
+            drawListDirty = true
+        }
         setNeedsDisplay()
     }
 
     private func maybeCompact() {
-        if holeVertices > 65536 || (vertexCapacity > 0 && holeVertices * 3 > vertexCapacity) {
+        if holeVertices > 65536 || (vertexCapacity > 0 && holeVertices * 3 > vertexCapacity)
+            || holeIndices > 262_144 || (indexCapacity > 0 && holeIndices * 3 > indexCapacity) {
             compact()
         }
     }
 
-    /// 更新 live 笔画 mesh（nil = 清除）。每输入事件调用。
+    /// 按 order 从 CPU 侧 meshes 一次线性重排整个缓冲（批量替换/LOD 用）
+    private func rebuildBuffers() {
+        var totalV = 0, totalI = 0
+        for id in order {
+            guard let m = meshes[id], !m.isEmpty else { continue }
+            totalV += m.vertices.count
+            totalI += m.indices.count
+        }
+        // ensureCapacity 扩容时内部已经用 meshes 重建过一遍，别再重排第二次
+        let grew = totalV > vertexCapacity || totalI > indexCapacity
+        let ok = ensureCapacity(vertices: totalV, indices: totalI)
+        if !ok {
+            print("[StrokeMetalView] WARNING: batch upsert exceeds buffer cap")
+            onBufferFull?(order.count)
+        }
+        if !grew || !ok {
+            compact()   // compact 自带容量守卫，写不下的笔只是不画，不会越界
+        }
+    }
+
+    /// 更新 live 笔画 mesh（nil = 清除）。橡皮/套索轨迹等全量路径用。
     func setLiveMesh(_ mesh: StrokeMesh?, kind: BrushKind = .pen) {
-        liveKind = kind
         guard let mesh, !mesh.isEmpty else {
+            liveKind = kind
             liveIndexCount = 0
-            liveVerticesCache = []
+            liveNeedsFullUpload = false
             setNeedsDisplay()
             return
         }
-        liveVerticesCache = mesh.vertices
-        guard ensureLiveCapacity(vertices: mesh.vertices.count, indices: mesh.indices.count) else {
+        updateLiveMesh(
+            vertices: mesh.vertices, indices: mesh.indices,
+            dirtyVertexStart: 0, dirtyIndexStart: 0, kind: kind
+        )
+        // 这条全量路径（橡皮/套索轨迹）与增量构建器不共享状态，缓冲里现在是别的几何。
+        // 万一之后有人接着做增量更新，前缀就是陈的 —— 强制下一次整段重传。
+        liveNeedsFullUpload = true
+    }
+
+    /// 增量更新 live 笔画：只把 [dirtyVertexStart...] / [dirtyIndexStart...] 重传给 GPU。
+    /// 笔画已确认的前缀在整笔期间逐字节不变（见 LiveStrokeMesh），
+    /// 每事件重传全量是 O(n) 的纯浪费——一笔 3 秒的字会白传约 23 MB。
+    func updateLiveMesh(
+        vertices: [StrokeVertex], indices: [UInt32],
+        dirtyVertexStart: Int, dirtyIndexStart: Int, kind: BrushKind
+    ) {
+        liveKind = kind
+        guard !vertices.isEmpty, !indices.isEmpty else {
+            liveIndexCount = 0
+            liveNeedsFullUpload = false
+            setNeedsDisplay()
             return
         }
-        copyVertices(mesh.vertices, into: liveVertexBuffer, atVertex: 0)
-        copyIndices(mesh.indices, into: liveIndexBuffer, atIndex: 0)
-        liveIndexCount = mesh.indices.count
+        let grow = ensureLiveCapacity(vertices: vertices.count, indices: indices.count)
+        guard grow.ok else {
+            // 分配失败：缓冲内容不可信，下次必须整段重传
+            liveNeedsFullUpload = true
+            return
+        }
+        // 换了新 MTLBuffer（旧内容丢失）或 renderOrigin 变了，都必须整段重传，
+        // 否则「稳定前缀」里留着垃圾或旧原点的坐标。
+        let full = grow.reallocated || liveNeedsFullUpload
+        liveNeedsFullUpload = false
+        let vStart = full ? 0 : min(max(dirtyVertexStart, 0), vertices.count)
+        let iStart = full ? 0 : min(max(dirtyIndexStart, 0), indices.count)
+        if vStart < vertices.count {
+            copyVertices(vertices[vStart...], into: liveVertexBuffer, atVertex: vStart)
+        }
+        if iStart < indices.count {
+            copyIndices(indices[iStart...], into: liveIndexBuffer, atIndex: iStart)
+        }
+        liveIndexCount = indices.count
         setNeedsDisplay()
     }
 
@@ -318,16 +464,34 @@ final class StrokeMetalView: MTKView, MTKViewDelegate {
 
     @discardableResult
     private func appendMesh(_ mesh: StrokeMesh, id: UUID) -> Bool {
-        guard !mesh.isEmpty else { return true }
-        guard ensureCapacity(
+        guard !mesh.isEmpty else {
+            ranges.removeValue(forKey: id)
+            return true
+        }
+        if !ensureCapacity(
             vertices: vertexCount + mesh.vertices.count,
             indices: indexCount + mesh.indices.count
-        ) else {
-            print("[StrokeMetalView] WARNING: stroke buffer full, stroke dropped")
-            return false
+        ) {
+            // 先回收删除留下的空洞再试一次：缓冲「满」往往只是碎了，不是真的用光
+            if holeVertices > 0 || holeIndices > 0 {
+                compact()
+            }
+            guard ensureCapacity(
+                vertices: vertexCount + mesh.vertices.count,
+                indices: indexCount + mesh.indices.count
+            ) else {
+                print("[StrokeMetalView] WARNING: stroke buffer full, stroke dropped")
+                ranges.removeValue(forKey: id)
+                return false
+            }
         }
-        copyVertices(mesh.vertices, into: vertexBuffer, atVertex: vertexCount)
-        copyIndices(mesh.indices, into: indexBuffer, atIndex: indexCount)
+        // ensureCapacity / compact 会按 (order, meshes) 整体重排缓冲。本笔的
+        // mesh 在调用前就已经写进 meshes、id 也已在 order 里，所以重排时它
+        // **已经被放好了**——这时再 append 一次就是把同一份几何写两遍：
+        // vertexCount 翻倍，且第二份很可能落到 MTLBuffer 末尾之外。
+        if ranges[id] != nil { return true }
+        copyVertices(mesh.vertices[...], into: vertexBuffer, atVertex: vertexCount)
+        copyIndices(mesh.indices[...], into: indexBuffer, atIndex: indexCount)
         ranges[id] = IndexRange(
             vertexOffset: vertexCount,
             indexOffset: indexCount,
@@ -338,14 +502,24 @@ final class StrokeMetalView: MTKView, MTKViewDelegate {
         return true
     }
 
-    /// 空洞整理：按 order 重建 buffer
+    /// 空洞整理：按 order 重建 buffer。
+    /// 容量守卫必不可少：缓冲写满后若还有 LOD 重建进来，无守卫的 memcpy 会写到
+    /// 25MB MTLBuffer 之外（越界写 + 之后 vertexCount > vertexCapacity 全线失效）。
     private func compact() {
         var v = 0
         var idx = 0
+        var overflow = 0
         for id in order {
             guard let mesh = meshes[id], !mesh.isEmpty else { continue }
-            copyVertices(mesh.vertices, into: vertexBuffer, atVertex: v)
-            copyIndices(mesh.indices, into: indexBuffer, atIndex: idx)
+            guard v + mesh.vertices.count <= vertexCapacity,
+                  idx + mesh.indices.count <= indexCapacity
+            else {
+                ranges.removeValue(forKey: id)
+                overflow += 1
+                continue
+            }
+            copyVertices(mesh.vertices[...], into: vertexBuffer, atVertex: v)
+            copyIndices(mesh.indices[...], into: indexBuffer, atIndex: idx)
             ranges[id] = IndexRange(vertexOffset: v, indexOffset: idx, indexCount: mesh.indices.count)
             v += mesh.vertices.count
             idx += mesh.indices.count
@@ -354,27 +528,39 @@ final class StrokeMetalView: MTKView, MTKViewDelegate {
         indexCount = idx
         holeVertices = 0
         holeIndices = 0
+        drawListDirty = true
+        if overflow > 0 {
+            print("[StrokeMetalView] WARNING: \(overflow) strokes exceed buffer capacity, not drawn")
+        }
     }
 
+    /// 两个维度各自扩容后只重建一次（原来两边都扩时整库 memcpy 会白做两遍）
     private func ensureCapacity(vertices: Int, indices: Int) -> Bool {
         guard vertices <= Self.maxVertices, indices <= Self.maxIndices else { return false }
+        var grew = false
         if vertices > vertexCapacity {
-            vertexCapacity = max(max(vertices, Self.initialVertexCapacity), vertexCapacity * 2)
-            vertexBuffer = device?.makeBuffer(
-                length: vertexCapacity * 24, options: .storageModeShared
-            )
-            if vertexBuffer == nil { return false }
-            // 扩容后旧数据丢失 -> 重建（ranges 失效前先 compact，用 meshes 字典）
-            compactIntoNewBuffers()
+            let want = max(max(vertices, Self.initialVertexCapacity), vertexCapacity * 2)
+            guard let buf = device?.makeBuffer(length: want * 24, options: .storageModeShared) else {
+                // 分配失败必须回滚容量，否则后续写入会以为有空间（buffer 为 nil，
+                // copyVertices 静默不写），笔画从此再也画不出来且无法恢复。
+                return false
+            }
+            vertexCapacity = want
+            vertexBuffer = buf
+            grew = true
         }
         if indices > indexCapacity {
-            indexCapacity = max(max(indices, Self.initialIndexCapacity), indexCapacity * 2)
-            indexBuffer = device?.makeBuffer(
-                length: indexCapacity * 4, options: .storageModeShared
-            )
-            if indexBuffer == nil { return false }
-            compactIntoNewBuffers()
+            let want = max(max(indices, Self.initialIndexCapacity), indexCapacity * 2)
+            guard let buf = device?.makeBuffer(length: want * 4, options: .storageModeShared) else {
+                if grew { compactIntoNewBuffers() }   // 顶点缓冲已经换新，必须重填
+                return false
+            }
+            indexCapacity = want
+            indexBuffer = buf
+            grew = true
         }
+        // 扩容后旧 buffer 的数据丢失 -> 用 CPU 侧 meshes 字典重建一次
+        if grew { compactIntoNewBuffers() }
         return vertexBuffer != nil && indexBuffer != nil
     }
 
@@ -385,10 +571,11 @@ final class StrokeMetalView: MTKView, MTKViewDelegate {
         for id in order {
             guard let mesh = meshes[id], !mesh.isEmpty else { continue }
             if v + mesh.vertices.count > vertexCapacity || idx + mesh.indices.count > indexCapacity {
-                break // 极端情况：本次扩容仍不够（另一维先扩），留待下次
+                ranges.removeValue(forKey: id)
+                continue // 极端情况：本次扩容仍不够（另一维先扩），留待下次
             }
-            copyVertices(mesh.vertices, into: vertexBuffer, atVertex: v)
-            copyIndices(mesh.indices, into: indexBuffer, atIndex: idx)
+            copyVertices(mesh.vertices[...], into: vertexBuffer, atVertex: v)
+            copyIndices(mesh.indices[...], into: indexBuffer, atIndex: idx)
             ranges[id] = IndexRange(vertexOffset: v, indexOffset: idx, indexCount: mesh.indices.count)
             v += mesh.vertices.count
             idx += mesh.indices.count
@@ -397,25 +584,42 @@ final class StrokeMetalView: MTKView, MTKViewDelegate {
         indexCount = idx
         holeVertices = 0
         holeIndices = 0
+        drawListDirty = true
     }
 
-    private func ensureLiveCapacity(vertices: Int, indices: Int) -> Bool {
-        guard vertices <= Self.maxVertices, indices <= Self.maxIndices else { return false }
-        if vertices > liveVertexCapacity {
-            liveVertexCapacity = max(vertices, max(liveVertexCapacity * 2, 1024))
-            liveVertexBuffer = device?.makeBuffer(length: liveVertexCapacity * 24, options: .storageModeShared)
+    /// - Returns: ok = 缓冲可用；reallocated = 换了新 MTLBuffer（旧内容已丢，必须全量重传）
+    private func ensureLiveCapacity(vertices: Int, indices: Int) -> (ok: Bool, reallocated: Bool) {
+        guard vertices <= Self.maxVertices, indices <= Self.maxIndices else { return (false, false) }
+        var reallocated = false
+        if vertices > liveVertexCapacity || liveVertexBuffer == nil {
+            let want = max(vertices, max(liveVertexCapacity * 2, 1024))
+            // 容量只在分配成功后才提升：先提后判会让每个输入事件都再翻一倍，
+            // 几十次之后 want * 24 整数溢出直接 trap。
+            guard let buf = device?.makeBuffer(length: want * 24, options: .storageModeShared) else {
+                return (false, reallocated)
+            }
+            liveVertexCapacity = want
+            liveVertexBuffer = buf
+            reallocated = true
         }
-        if indices > liveIndexCapacity {
-            liveIndexCapacity = max(indices, max(liveIndexCapacity * 2, 4096))
-            liveIndexBuffer = device?.makeBuffer(length: liveIndexCapacity * 4, options: .storageModeShared)
+        if indices > liveIndexCapacity || liveIndexBuffer == nil {
+            let want = max(indices, max(liveIndexCapacity * 2, 4096))
+            guard let buf = device?.makeBuffer(length: want * 4, options: .storageModeShared) else {
+                return (false, reallocated)
+            }
+            liveIndexCapacity = want
+            liveIndexBuffer = buf
+            reallocated = true
         }
-        return liveVertexBuffer != nil && liveIndexBuffer != nil
+        return (true, reallocated)
     }
 
     /// 上传顶点：绝对坐标 − renderOrigin（double 域相减）后存入 GPU 缓冲。
     /// 原点为零时走 memcpy 快路径（新画布默认行为不变）。
-    private func copyVertices(_ vertices: [StrokeVertex], into buffer: MTLBuffer?, atVertex offset: Int) {
-        guard let ptr = buffer?.contents() else { return }
+    private func copyVertices(
+        _ vertices: ArraySlice<StrokeVertex>, into buffer: MTLBuffer?, atVertex offset: Int
+    ) {
+        guard let ptr = buffer?.contents(), !vertices.isEmpty else { return }
         let ox = Double(renderOrigin.x), oy = Double(renderOrigin.y)
         if ox == 0 && oy == 0 {
             vertices.withUnsafeBytes { src in
@@ -435,12 +639,78 @@ final class StrokeMetalView: MTKView, MTKViewDelegate {
         }
     }
 
-    private func copyIndices(_ indices: [UInt32], into buffer: MTLBuffer?, atIndex offset: Int) {
-        guard let ptr = buffer?.contents() else { return }
+    private func copyIndices(
+        _ indices: ArraySlice<UInt32>, into buffer: MTLBuffer?, atIndex offset: Int
+    ) {
+        guard let ptr = buffer?.contents(), !indices.isEmpty else { return }
         indices.withUnsafeBytes { src in
             guard let base = src.baseAddress else { return }
             memcpy(ptr.advanced(by: offset * 4), base, src.count)
         }
+    }
+
+    // MARK: - 绘制列表重建
+
+    /// 按 order 走一遍，拆成荧光笔/墨线两条稠密列表。
+    /// 只在内容变更时跑（提交/擦除/撤销/加载），不在每帧跑。
+    private func rebuildDrawLists() {
+        drawListDirty = false
+        highlighterItems.removeAll(keepingCapacity: true)
+        inkItems.removeAll(keepingCapacity: true)
+        drawSlot.removeAll(keepingCapacity: true)
+        highlighterItems.reserveCapacity(order.count / 8 + 1)
+        inkItems.reserveCapacity(order.count)
+        drawSlot.reserveCapacity(order.count)
+        for id in order {
+            guard let range = ranges[id], range.indexCount > 0 else { continue }
+            appendDrawItem(id: id, range: range)
+        }
+    }
+
+    private func appendDrawItem(id: UUID, range: IndexRange) {
+        var item = DrawItem(
+            vertexOffset: range.vertexOffset,
+            indexOffset: range.indexOffset,
+            indexCount: range.indexCount,
+            minX: 1, minY: 0, maxX: 0, maxY: 0   // 默认哨兵：无 bounds -> 恒绘制
+        )
+        if let b = boundsMap[id], !b.isNull {
+            item.minX = b.minX
+            item.minY = b.minY
+            item.maxX = b.maxX
+            item.maxY = b.maxY
+        }
+        if kindMap[id] == .highlighter {
+            drawSlot[id] = (true, highlighterItems.count)
+            highlighterItems.append(item)
+        } else {
+            drawSlot[id] = (false, inkItems.count)
+            inkItems.append(item)
+        }
+    }
+
+    /// 只有包围盒变了（顶点/索引数与偏移都没动）：原地改，别整表重建。
+    /// 拖动选中笔画时这条路径每帧每笔都会走一次。
+    /// - Returns: 是否成功原地更新
+    private func patchDrawItemBounds(id: UUID, bounds: CGRect) -> Bool {
+        guard !drawListDirty, let slot = drawSlot[id] else { return false }
+        let null = bounds.isNull
+        let minX = null ? 1 : bounds.minX, maxX = null ? 0 : bounds.maxX
+        let minY = null ? 0 : bounds.minY, maxY = null ? 0 : bounds.maxY
+        if slot.highlighter {
+            guard slot.index < highlighterItems.count else { return false }
+            highlighterItems[slot.index].minX = minX
+            highlighterItems[slot.index].minY = minY
+            highlighterItems[slot.index].maxX = maxX
+            highlighterItems[slot.index].maxY = maxY
+        } else {
+            guard slot.index < inkItems.count else { return false }
+            inkItems[slot.index].minX = minX
+            inkItems[slot.index].minY = minY
+            inkItems[slot.index].maxX = maxX
+            inkItems[slot.index].maxY = maxY
+        }
+        return true
     }
 
     // MARK: - MTKViewDelegate
@@ -477,21 +747,26 @@ final class StrokeMetalView: MTKView, MTKViewDelegate {
 
         // 已提交笔画（逐笔画视锥裁剪；荧光笔先画，落在墨线下，各层内保 z 序）
         if let vb = vertexBuffer, let ib = indexBuffer, !order.isEmpty {
+            if drawListDirty { rebuildDrawLists() }
             let visible = viewport.visibleWorldRect
+            let vx0 = visible.minX, vx1 = visible.maxX
+            let vy0 = visible.minY, vy1 = visible.maxY
             encoder.setVertexBuffer(vb, offset: 0, index: 0)
-            func drawCommitted(highlighters: Bool) {
-                for id in order {
-                    let isHi = kindMap[id] == .highlighter
-                    guard isHi == highlighters, let range = ranges[id] else { continue }
-                    if let b = boundsMap[id], !b.isNull, !b.intersects(visible) { continue }
+            func drawCommitted(_ items: [DrawItem]) {
+                for it in items {
+                    // minX > maxX 是「无 bounds」哨兵：与旧的 `if let b = boundsMap[id]` 语义一致（恒绘制）
+                    if it.minX <= it.maxX,
+                       it.maxX < vx0 || it.minX > vx1 || it.maxY < vy0 || it.minY > vy1 {
+                        continue
+                    }
                     encoder.drawIndexedPrimitives(
                         type: .triangle,
-                        indexCount: range.indexCount,
+                        indexCount: it.indexCount,
                         indexType: .uint32,
                         indexBuffer: ib,
-                        indexBufferOffset: range.indexOffset * 4,
+                        indexBufferOffset: it.indexOffset * 4,
                         instanceCount: 1,
-                        baseVertex: range.vertexOffset,
+                        baseVertex: it.vertexOffset,
                         baseInstance: 0
                     )
                 }
@@ -511,8 +786,8 @@ final class StrokeMetalView: MTKView, MTKViewDelegate {
             }
             // Live 笔画（不裁剪，必在附近）：荧光笔 live 与提交荧光笔同层先画
             if liveKind == .highlighter { drawLive() }
-            drawCommitted(highlighters: true)
-            drawCommitted(highlighters: false)
+            drawCommitted(highlighterItems)
+            drawCommitted(inkItems)
             if liveKind != .highlighter { drawLive() }
         } else if liveIndexCount > 0, let lvb = liveVertexBuffer, let lib = liveIndexBuffer {
             // 无已提交笔画时 live 独画

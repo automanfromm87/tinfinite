@@ -72,7 +72,9 @@ final class DrawingSettings: ObservableObject {
     @Published private(set) var strokeCount = 0
     @Published private(set) var canUndo = false
     @Published private(set) var canRedo = false
-    @Published private(set) var isDrawing = false
+    // 注意：这里曾有一个 @Published isDrawing。它没有任何读者，却让「落笔」这一刻
+    // 发一次 objectWillChange —— 整个详情页 body 在第一帧墨迹之前重算一遍。
+    // 需要落笔态时请读 controller.isLiveStrokeActive（UIKit 侧，不参与 SwiftUI 失效）。
     @Published private(set) var hasSelection = false
     @Published private(set) var selectedCount = 0
     @Published private(set) var nodeCount = 0
@@ -183,7 +185,6 @@ final class DrawingSettings: ObservableObject {
             if strokeCount != 0 { strokeCount = 0 }
             if canUndo != false { canUndo = false }
             if canRedo != false { canRedo = false }
-            if isDrawing != false { isDrawing = false }
             if hasSelection != false { hasSelection = false }
             if selectedCount != 0 { selectedCount = 0 }
             if nodeCount != 0 { nodeCount = 0 }
@@ -193,7 +194,6 @@ final class DrawingSettings: ObservableObject {
         if strokeCount != controller.strokeCount { strokeCount = controller.strokeCount }
         if canUndo != controller.canUndo { canUndo = controller.canUndo }
         if canRedo != controller.canRedo { canRedo = controller.canRedo }
-        if isDrawing != controller.isLiveStrokeActive { isDrawing = controller.isLiveStrokeActive }
         if hasSelection != controller.hasSelection { hasSelection = controller.hasSelection }
         if selectedCount != controller.selectedCount { selectedCount = controller.selectedCount }
         if nodeCount != controller.nodeCount { nodeCount = controller.nodeCount }

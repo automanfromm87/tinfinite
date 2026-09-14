@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- ProMotion 解锁：不设这个键，iPadOS 把整个 App（CADisplayLink、
+	     CAMetalLayer 呈现、CA commit）钳在 60Hz，墨迹平均多 ~8ms 延迟。
+	     注意不能写成 INFOPLIST_KEY_CADisableMinimumFrameDuration —— 该键不在
+	     Xcode 的 INFOPLIST_KEY_* 白名单里，会被静默丢弃。必须走真实 plist，
+	     与 GENERATE_INFOPLIST_FILE=YES 生成的键合并。
+	     验证：plutil -p "$BUILT_PRODUCTS_DIR/Canvas.app/Info.plist" | grep CADisable
+	     必须打印 => 1（真 boolean），而不是 => "YES"。 -->
+	<key>CADisableMinimumFrameDuration</key>
+	<true/>
+</dict>
+</plist>

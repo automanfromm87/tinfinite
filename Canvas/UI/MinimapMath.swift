@@ -3,7 +3,7 @@
 
 import CoreGraphics
 
-enum MinimapMath {
+nonisolated enum MinimapMath {
     /// 内容并集（笔画 bounds + 节点世界矩形），空内容返回 nil
     static func contentUnion(strokes: [CGRect], items: [CGRect]) -> CGRect? {
         var rect: CGRect?

@@ -39,6 +39,11 @@ nonisolated struct ContentStore: Sendable {
     /// 撤销栈深度（Controller 跨域 journal 用：比较调用前后判断是否产生了新条目）
     var undoDepth: Int { undoStack.count }
 
+    /// 同 StrokeStore：栈满后 undoDepth 不再变化，必须用单调序号记账
+    private(set) var mutationSeq = 0
+    private(set) var discardSeq = 0
+    var undoMark: UndoMark { UndoMark(seq: mutationSeq, discarded: discardSeq) }
+
     func node(id: UUID) -> ContentNode? {
         nodes.first { $0.id == id }
     }
@@ -152,8 +157,11 @@ nonisolated struct ContentStore: Sendable {
 
     private mutating func pushUndo(_ entry: ContentUndoEntry) {
         undoStack.append(entry)
+        mutationSeq += 1
         if undoStack.count > Self.maxUndoDepth {
-            undoStack.removeFirst(undoStack.count - Self.maxUndoDepth)
+            let drop = undoStack.count - Self.maxUndoDepth
+            undoStack.removeFirst(drop)
+            discardSeq += drop
         }
         redoStack.removeAll()
     }

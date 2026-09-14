@@ -10,6 +10,15 @@ Core ideas:
 - **Strokes**: PencilKit-style pipeline — 240 Hz coalesced sampling, ribbon
   tessellation, one shared append-only Metal buffer with hole compaction, MSAA,
   per-stroke frustum culling, and zoom-adaptive LOD.
+- **Live ink is incremental**: the confirmed spine is append-only, so
+  `LiveStrokeMesh` re-tessellates only the last two Catmull-Rom segments plus the
+  predicted tail and the two caps, and uploads only the changed byte range —
+  O(1) per input event instead of O(stroke length). Its output is pinned
+  byte-for-byte to `StrokeGeometry.tessellate` by a differential test.
+- **Nothing expensive on the touch→photon path**: the committed-stroke draw loop
+  walks two dense arrays (no per-stroke dictionary lookups), the selection
+  overlay hides itself when empty instead of invalidating a full-screen backing
+  store every frame, and autosave defers while the pen is down.
 - **Content nodes**: shape / text / sticky-note / image nodes as world-space views
   with tap-select, drag-move, in-place text editing, and offscreen virtualization.
 - **Documents**: multi-canvas library with atomic + backup-rotation saves,
@@ -56,3 +65,9 @@ Debug launch arguments (DEBUG builds only):
   - `Demo/` — DEBUG-only self-test harness
 - `CanvasUITests/` — XCUITest gesture regression suite
 - `Tests/` — `swiftc`-compiled logic suites (`run_tests.sh`)
+- `Canvas-Info.plist` — merged with the generated plist (`GENERATE_INFOPLIST_FILE`
+  stays on). Holds `CADisableMinimumFrameDuration`, which is what unlocks 120 Hz
+  on ProMotion; the `INFOPLIST_KEY_…` build-setting form of that key is **not** in
+  Xcode's allowlist and is silently dropped. Kept outside the `Canvas/` synchronized
+  group so it is never picked up as a bundle resource. Verify after a build with:
+  `plutil -p "$BUILT_PRODUCTS_DIR/Canvas.app/Info.plist" | grep CADisable` → `=> 1`.

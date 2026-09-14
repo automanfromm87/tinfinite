@@ -51,6 +51,14 @@ final class DrawingController: NSObject {
     /// 状态变化回调（笔画/模式/工具/选择/可撤销性，离散事件，无需节流）
     var onChange: (() -> Void)?
 
+    /// 渲染缓冲写满、笔画无法上屏时回调（参数为累计丢弃数）。
+    /// 上层可据此提示「本画布已达渲染上限」，而不是让墨迹凭空消失。
+    var onCanvasFull: ((Int) -> Void)?
+    /// 因缓冲写满而未能上屏的笔画累计数（模型里仍在，只是画不出来）
+    private(set) var droppedStrokeCount = 0
+
+    private static let log = Logger(subsystem: "canvas", category: "drawing")
+
     // MARK: - 状态（只读，透传 Store）
 
     var strokes: [Stroke] { store.strokes }
@@ -82,19 +90,37 @@ final class DrawingController: NSObject {
     private var undoJournal: [EditDomain] = []
     private var redoJournal: [EditDomain] = []
 
-    /// 笔画变更记账（比较调用前后 undoDepth，有新条目才记；空操作不记）
-    private func noteStrokeMutation(from depth: Int) {
-        if store.undoDepth != depth {
-            undoJournal.append(.strokes)
-            redoJournal.removeAll()
-        }
+    /// 笔画变更记账（比较调用前后的变更水位，有新条目才记；空操作/合并输入不记）。
+    /// 用单调序号而非栈深度：栈满 maxUndoDepth 后深度恒定，用深度会永久漏记。
+    private func noteStrokeMutation(from mark: UndoMark) {
+        note(domain: .strokes, before: mark, after: store.undoMark)
     }
 
-    /// 节点变更记账（同上；连续输入合并后 depth 不变，只记一次）
-    private func noteContentMutation(from depth: Int) {
-        if content.undoDepth != depth {
-            undoJournal.append(.nodes)
-            redoJournal.removeAll()
+    /// 节点变更记账（同上；连续输入合并后序号不变，只记一次）
+    private func noteContentMutation(from mark: UndoMark) {
+        note(domain: .nodes, before: mark, after: content.undoMark)
+    }
+
+    private func note(domain: EditDomain, before: UndoMark, after: UndoMark) {
+        guard after.seq != before.seq else { return }
+        undoJournal.append(domain)
+        redoJournal.removeAll()
+        // 该域的栈挤掉了几条，账本里就得同步丢掉同域最旧的几条，
+        // 否则账本条目数会比栈深，undo 到底时会分派到已不存在的条目上。
+        let evicted = after.discarded - before.discarded
+        if evicted > 0 { dropOldest(domain, count: evicted) }
+    }
+
+    private func dropOldest(_ domain: EditDomain, count: Int) {
+        var left = count
+        var i = 0
+        while i < undoJournal.count, left > 0 {
+            if undoJournal[i] == domain {
+                undoJournal.remove(at: i)
+                left -= 1
+            } else {
+                i += 1
+            }
         }
     }
 
@@ -105,6 +131,10 @@ final class DrawingController: NSObject {
 
     /// 笔 live 采样
     private var sampler = StrokeSampler()
+    /// live 网格增量构建器（每事件只重算脏尾巴，见 LiveStrokeMesh）
+    private var liveBuilder = LiveStrokeMesh()
+    /// 起笔时锁定的容差：整笔用同一个值，中途相机变化不会让增量前提失效
+    private var liveTolerance: CGFloat = 0.35
 
     /// 当前编辑动作
     private enum EditKind {
@@ -115,6 +145,13 @@ final class DrawingController: NSObject {
     }
 
     private var activeEdit: EditKind?
+
+    /// 本次编辑的落点与最大屏幕位移（判断「真的在画」用，见 freezeCanvasIfDragging）
+    private var editDownScreen: CGPoint?
+    private var editTravel: CGFloat = 0
+    private var canvasFrozen = false
+    /// 已消费样本的最新时间戳（同批触摸重复投递时去重用）
+    private var lastSampleTime: TimeInterval = -.infinity
 
     /// 橡皮/套索路径（屏幕+世界双存：屏幕做重采样/点选判断，世界做命中）
     private var editPathScreen: [CGPoint] = []
@@ -134,6 +171,11 @@ final class DrawingController: NSObject {
 
     /// 自动存档防抖
     private var saveWork: DispatchWorkItem?
+    /// 单调递增的「内容已变」计数与上次落盘时的值。
+    /// 没有它，flushAutosave（离开文档/切后台都会调）会无条件写一次盘，
+    /// 于是「只是打开看了一眼」也会刷新 updatedAt 并把文档顶到列表最前。
+    private var mutationCounter = 0
+    private var savedMutationCounter = -1
 
     init(canvas: InfiniteCanvasView, strokeView: StrokeMetalView, overlay: SelectionOverlayView) {
         self.canvas = canvas
@@ -142,6 +184,16 @@ final class DrawingController: NSObject {
         super.init()
         strokeRecognizer.addTarget(self, action: #selector(handleStroke(_:)))
         canvas.addGestureRecognizer(strokeRecognizer)
+        // renderOrigin 重定基后 live 顶点的相对坐标失效，重推一次（见 onLiveReuploadNeeded）
+        strokeView.onLiveReuploadNeeded = { [weak self] in self?.refreshEditPreview() }
+        // GPU 缓冲写满时笔画会画不出来。以前只有一行 print，用户只会看到「笔没了」；
+        // 这里把它变成可观测状态，自检/UI 都能拿到。
+        strokeView.onBufferFull = { [weak self] dropped in
+            guard let self else { return }
+            droppedStrokeCount += dropped
+            Self.log.error("stroke buffer full: \(dropped) strokes not rendered (total \(self.droppedStrokeCount))")
+            onCanvasFull?(droppedStrokeCount)
+        }
         applyTouchPolicy()
     }
 
@@ -159,6 +211,10 @@ final class DrawingController: NSObject {
     private func applyTouchPolicy() {
         // 节点只在 navigate 模式可交互
         updateNodeInteraction()
+        // 缩放只在「没有真的在画」时开放。写成幂等的派生状态而不是成对的
+        // 开/关 赋值：任何漏掉恢复的退出路径（比如落笔中途切模式）都会在
+        // 下一次应用触摸策略时自愈，不会把捏合缩放永久卡死。
+        canvas?.isZoomEnabled = !canvasFrozen
         switch mode {
         case .navigate:
             strokeRecognizer.isEnabled = false
@@ -196,6 +252,30 @@ final class DrawingController: NSObject {
 
     // MARK: - 触摸路由
 
+    /// 一次触摸采样的取值快照。
+    /// UITouch 是可变且会被系统复用的对象，跨事件持有会读到错位的坐标；
+    /// 而 `location(in:)`/`azimuthAngle(in:)` 每次调用都要做一次坐标系换算，
+    /// 原先每个 coalesced 触摸要调 2~3 次。取值一次、内部只传值，两个问题一起解决。
+    private struct InputSample {
+        var location: CGPoint
+        var pressure: CGFloat
+        var altitude: CGFloat
+        var azimuth: CGFloat
+        var time: TimeInterval
+        var isPencil: Bool
+    }
+
+    private func sample(_ touch: UITouch, in canvas: InfiniteCanvasView) -> InputSample {
+        InputSample(
+            location: touch.location(in: canvas),
+            pressure: pressure(for: touch),
+            altitude: altitude(for: touch),
+            azimuth: azimuth(for: touch, in: canvas),
+            time: touch.timestamp,
+            isPencil: touch.type == .pencil
+        )
+    }
+
     @objc private func handleStroke(_ recognizer: StrokeGestureRecognizer) {
         guard let canvas else { return }
         switch recognizer.state {
@@ -203,10 +283,28 @@ final class DrawingController: NSObject {
             // 按时间顺序起笔：从最早的 coalesced 点开始（tracked 是最新点，
             // 先用它 begin 会在 spine 开头造一个“最新->略早”的回钩，快画时可见）。
             // 点按路径（began 补发自 touchesEnded）coalesced 只有抬笔点，与 tracked 同一位置。
-            guard let touch = recognizer.pendingCoalesced.first ?? recognizer.trackedTouch else { return }
-            beginEdit(with: touch, canvas: canvas)
-            for t in recognizer.pendingCoalesced.dropFirst() {
-                appendEditTouch(t, canvas: canvas)
+            var samples = recognizer.pendingCoalesced.map { sample($0, in: canvas) }
+            if samples.isEmpty, let tracked = recognizer.trackedTouch {
+                samples = [sample(tracked, in: canvas)]
+            }
+            guard let head = samples.first else { return }
+            // 手指/指针模式仍有 3pt 延迟识别窗口，窗口里的 coalesced 点已经丢了；
+            // 至少把真实接触点补回队首，否则笔画头会整体偏移 3pt、起锋被削掉。
+            if let down = recognizer.downSampleLocation,
+               hypot(down.x - head.location.x, down.y - head.location.y) > 0.01 {
+                if recognizer.downSampleTime < head.time {
+                    var contact = head
+                    contact.location = down
+                    contact.time = recognizer.downSampleTime
+                    samples.insert(contact, at: 0)
+                } else {
+                    // 同一时刻：接触点**就是**这个样本，挪位置即可，别插入同时间的第二点
+                    samples[0].location = down
+                }
+            }
+            beginEdit(with: samples[0], canvas: canvas)
+            for s in samples.dropFirst() {
+                appendEditTouch(s, canvas: canvas)
             }
             if activeEdit == .penStroke {
                 updatePredicted(recognizer.pendingPredicted, canvas: canvas)
@@ -214,14 +312,21 @@ final class DrawingController: NSObject {
             refreshEditPreview()
         case .changed:
             for t in recognizer.pendingCoalesced {
-                appendEditTouch(t, canvas: canvas)
+                appendEditTouch(sample(t, in: canvas), canvas: canvas)
             }
             if activeEdit == .penStroke {
                 updatePredicted(recognizer.pendingPredicted, canvas: canvas)
             }
             refreshEditPreview()
         case .ended:
-            endEdit(canvas: canvas)
+            // 收尾事件同样可能带多个 coalesced 点；旧代码只用 .last，丢掉中间的轨迹。
+            // 注意点按路径：touchesEnded 里先补发 .began 再置 .ended，两次回调带的是
+            // **同一批** coalesced 触摸，所以必须按时间戳去重，否则这批点会进两遍。
+            let samples = recognizer.pendingCoalesced.map { sample($0, in: canvas) }
+            for s in samples.dropLast() {
+                appendEditTouch(s, canvas: canvas)
+            }
+            endEdit(last: samples.last, canvas: canvas)
         case .cancelled, .failed:
             cancelActiveEdit()
         default:
@@ -229,8 +334,8 @@ final class DrawingController: NSObject {
         }
     }
 
-    private func beginEdit(with touch: UITouch, canvas: InfiniteCanvasView) {
-        let loc = touch.location(in: canvas)
+    private func beginEdit(with touch: InputSample, canvas: InfiniteCanvasView) {
+        let loc = touch.location
         switch tool {
         case .pen:
             activeEdit = .penStroke
@@ -254,17 +359,42 @@ final class DrawingController: NSObject {
             }
         }
         isLiveStrokeActive = true
-        // 落笔中途关掉双指撤销手势（第二根手指点按不应撤掉已提交的笔画）
-        canvas.isUndoGestureEnabled = false
-        // 笔触落笔时禁用 pan：手掌 resting 在屏上拖动不会平移画布
-        if touch.type == .pencil {
-            canvas.panGesture.isEnabled = false
-        }
+        editDownScreen = loc
+        editTravel = 0
+        canvasFrozen = false
+        lastSampleTime = touch.time
+        // 惯性是**非自愿**的相机运动：采样器每个点都按「当前」相机换算世界坐标，
+        // 画布在笔下滑走会把屏幕上的直线写成世界里的斜拉变形（实测可达 120 世界单位）。
+        // 这个必须在接触的一瞬间就停，没有商量余地。
+        canvas.stopInertia()
+        // 但 pan/缩放的「冻结」要等到确实在画（见 freezeCanvasIfDragging）：
+        // 笔尖只是搁在屏幕上时若立刻禁掉平移/捏合，用户就再也缩放不了了。
         onChange?()
     }
 
-    private func appendEditTouch(_ touch: UITouch, canvas: InfiniteCanvasView) {
-        let loc = touch.location(in: canvas)
+    /// 位移超过阈值才认定「真的在画」，此时才冻结画布。
+    /// 阈值取 6pt（< tapSlop 10pt）：笔尖静置的抖动远小于它，而任何真实笔画
+    /// 都会在头几个 240Hz 采样内越过它，冻结发生在肉眼无法察觉的时间里。
+    private func freezeCanvasIfDragging(_ location: CGPoint, canvas: InfiniteCanvasView) {
+        guard !canvasFrozen, let down = editDownScreen else { return }
+        editTravel = max(editTravel, hypot(location.x - down.x, location.y - down.y))
+        guard editTravel >= Self.freezeSlop else { return }
+        canvasFrozen = true
+        canvas.isZoomEnabled = false
+        // 作画时禁用 pan：手掌 resting 在屏上拖动不会平移画布
+        canvas.panGesture.isEnabled = false
+        // 也在此刻才关掉双指撤销：笔尖只是搁着的时候，双指点按撤销应该照常可用
+        canvas.isUndoGestureEnabled = false
+    }
+
+    private static let freezeSlop: CGFloat = 6
+
+    private func appendEditTouch(_ touch: InputSample, canvas: InfiniteCanvasView) {
+        // 点按路径会把同一批 coalesced 触摸送两遍（began 补发 + ended），按时间戳去重
+        guard touch.time > lastSampleTime else { return }
+        lastSampleTime = touch.time
+        freezeCanvasIfDragging(touch.location, canvas: canvas)
+        let loc = touch.location
         switch activeEdit {
         case .penStroke:
             appendLiveTouch(touch, canvas: canvas)
@@ -279,10 +409,10 @@ final class DrawingController: NSObject {
         }
     }
 
-    private func endEdit(canvas: InfiniteCanvasView) {
+    private func endEdit(last: InputSample?, canvas: InfiniteCanvasView) {
         switch activeEdit {
         case .penStroke:
-            if let touch = strokeRecognizer.pendingCoalesced.last {
+            if let touch = last {
                 endLiveStroke(with: touch, canvas: canvas)
             } else {
                 cancelActiveEdit()
@@ -301,9 +431,12 @@ final class DrawingController: NSObject {
         editPathScreen = []
         editPathWorld = []
         isLiveStrokeActive = false
+        editDownScreen = nil
+        canvasFrozen = false
+        lastSampleTime = -.infinity
         strokeView?.setLiveMesh(nil)
         clearDragHints()
-        // 恢复触摸策略（撤销手势 + 笔触禁掉的 pan）
+        // 恢复触摸策略（撤销手势 + 作画时冻结的 pan/缩放，由 applyTouchPolicy 派生）
         canvas.isUndoGestureEnabled = true
         applyTouchPolicy()
         onChange?()
@@ -322,9 +455,12 @@ final class DrawingController: NSObject {
         editPathScreen = []
         editPathWorld = []
         isLiveStrokeActive = false
+        editDownScreen = nil
+        canvasFrozen = false
+        lastSampleTime = -.infinity
         strokeView?.setLiveMesh(nil)
         clearDragHints()
-        // 与 endEdit 同步恢复（取消路径也要还回 pan/撤销手势）
+        // 与 endEdit 同步恢复（取消路径也要还回 pan/缩放/撤销手势）
         canvas?.isUndoGestureEnabled = true
         applyTouchPolicy()
         onChange?()
@@ -332,30 +468,30 @@ final class DrawingController: NSObject {
 
     // MARK: - 笔管线
 
-    private func beginLiveStroke(with touch: UITouch, canvas: InfiniteCanvasView) {
+    private func beginLiveStroke(with touch: InputSample, canvas: InfiniteCanvasView) {
         sampler = StrokeSampler()
         sampler.style = style
         sampler.worldConverter = { [weak canvas] screen in
             canvas?.screenToWorld(screen) ?? screen
         }
-        let loc = touch.location(in: canvas)
         sampler.begin(
-            screen: loc,
-            pressure: pressure(for: touch),
-            altitude: altitude(for: touch),
-            azimuth: azimuth(for: touch, in: canvas),
-            time: touch.timestamp
+            screen: touch.location,
+            pressure: touch.pressure,
+            altitude: touch.altitude,
+            azimuth: touch.azimuth,
+            time: touch.time
         )
+        liveTolerance = currentTolerance()
+        liveBuilder.begin(style: style, tolerance: liveTolerance)
     }
 
-    private func appendLiveTouch(_ touch: UITouch, canvas: InfiniteCanvasView) {
-        let loc = touch.location(in: canvas)
+    private func appendLiveTouch(_ touch: InputSample, canvas: InfiniteCanvasView) {
         sampler.append(
-            screen: loc,
-            pressure: pressure(for: touch),
-            altitude: altitude(for: touch),
-            azimuth: azimuth(for: touch, in: canvas),
-            time: touch.timestamp
+            screen: touch.location,
+            pressure: touch.pressure,
+            altitude: touch.altitude,
+            azimuth: touch.azimuth,
+            time: touch.time
         )
     }
 
@@ -363,24 +499,24 @@ final class DrawingController: NSObject {
         sampler.setPredicted(predicted.map { $0.location(in: canvas) })
     }
 
-    private func endLiveStroke(with touch: UITouch, canvas: InfiniteCanvasView) {
-        let loc = touch.location(in: canvas)
+    private func endLiveStroke(with touch: InputSample, canvas: InfiniteCanvasView) {
         sampler.end(
-            screen: loc,
-            pressure: pressure(for: touch),
-            altitude: altitude(for: touch),
-            azimuth: azimuth(for: touch, in: canvas),
-            time: touch.timestamp
+            screen: touch.location,
+            pressure: touch.pressure,
+            altitude: touch.altitude,
+            azimuth: touch.azimuth,
+            time: touch.time
         )
-        let strokeDepth = store.undoDepth
+        let strokeMark = store.undoMark
+        // 用起笔时锁定的容差提交：与刚才预览的网格同一参数，落笔瞬间不会「跳变细节」
         let (stroke, sync) = store.commitStroke(
             rawPoints: sampler.rawPoints,
             spine: sampler.spine,
             style: style,
-            tolerance: currentTolerance()
+            tolerance: liveTolerance
         )
         _ = stroke
-        noteStrokeMutation(from: strokeDepth)
+        noteStrokeMutation(from: strokeMark)
         apply(sync)
         scheduleAutosave()
     }
@@ -407,20 +543,25 @@ final class DrawingController: NSObject {
         switch activeEdit {
         case .penStroke:
             clearDragHints()
-            let spine = sampler.displaySpine
-            guard !spine.isEmpty else {
-                strokeView.setLiveMesh(nil)
+            guard !sampler.spine.isEmpty else {
+                strokeView.setLiveMesh(nil, kind: style.kind)
                 return
             }
-            strokeView.setLiveMesh(StrokeGeometry.tessellate(
-                spine: spine, color: style.color, flattenTolerance: currentTolerance(),
-                grain: style.grain
-            ), kind: style.kind)
+            // 增量：只重算「最后两段 + 预测尾 + 圆头」，只重传变动的字节。
+            // 全量重建是 O(笔长)/事件、O(笔长²)/笔，长笔会越写越卡。
+            liveBuilder.update(confirmed: sampler.spine, predicted: sampler.predictedTail)
+            strokeView.updateLiveMesh(
+                vertices: liveBuilder.vertices,
+                indices: liveBuilder.indices,
+                dirtyVertexStart: liveBuilder.dirtyVertexStart,
+                dirtyIndexStart: liveBuilder.dirtyIndexStart,
+                kind: style.kind
+            )
         case .eraser:
             overlay?.lassoEnds = nil
             strokeView.setLiveMesh(trailMesh(width: eraserWidth))
             if let last = editPathWorld.last {
-                overlay?.eraserCursor = (center: last, radius: eraserWidth * 0.5)
+                overlay?.eraserCursor = SelectionOverlayView.EraserCursor(center: last, radius: eraserWidth * 0.5)
             } else {
                 overlay?.eraserCursor = nil
             }
@@ -432,7 +573,7 @@ final class DrawingController: NSObject {
                 color: RGBA(r: 0.1, g: 0.45, b: 1.0, a: 0.85)
             ))
             if let first = editPathWorld.first, let last = editPathWorld.last {
-                overlay?.lassoEnds = (start: first, current: last)
+                overlay?.lassoEnds = SelectionOverlayView.LassoEnds(start: first, current: last)
             } else {
                 overlay?.lassoEnds = nil
             }
@@ -462,13 +603,13 @@ final class DrawingController: NSObject {
         guard editPathWorld.count >= 2 else { return }
         let radius = eraserWidth * 0.5
         let sync: RenderSync
-        let strokeDepth = store.undoDepth
+        let strokeMark = store.undoMark
         if tool == .eraserPartial {
             sync = store.erasePartial(path: editPathWorld, radius: radius, tolerance: currentTolerance())
         } else {
             sync = store.eraseStrokes(path: editPathWorld, radius: radius)
         }
-        noteStrokeMutation(from: strokeDepth)
+        noteStrokeMutation(from: strokeMark)
         if !sync.isEmpty {
             apply(sync)
             refreshSelectionOverlay()
@@ -521,9 +662,9 @@ final class DrawingController: NSObject {
 
     private func commitMove() {
         guard let state = moveState else { return }
-        let strokeDepth = store.undoDepth
+        let strokeMark = store.undoMark
         let sync = store.commitMoveSelection(by: state.totalDelta)
-        noteStrokeMutation(from: strokeDepth)
+        noteStrokeMutation(from: strokeMark)
         if !sync.isEmpty {
             apply(sync)
             scheduleAutosave()
@@ -536,15 +677,15 @@ final class DrawingController: NSObject {
     func deleteSelection() {
         // 笔画与节点互斥选中，同时只可能一边非空
         if let nodeID = content.selectedID {
-            let contentDepth = content.undoDepth
+            let contentMark = content.undoMark
             content.remove(ids: [nodeID])
-            noteContentMutation(from: contentDepth)
+            noteContentMutation(from: contentMark)
             removeNodeViews(ids: [nodeID])
             scheduleAutosave()
         }
-        let strokeDepth = store.undoDepth
+        let strokeMark = store.undoMark
         let sync = store.deleteSelection()
-        noteStrokeMutation(from: strokeDepth)
+        noteStrokeMutation(from: strokeMark)
         if !sync.isEmpty {
             apply(sync)
             scheduleAutosave()
@@ -582,65 +723,68 @@ final class DrawingController: NSObject {
 
     // MARK: - Undo/Redo/Clear/合成
 
+    /// 账本条目可能因为对应栈被上限裁掉而失效；遇到空操作就继续往下找，
+    /// 否则一次点击会被「吃掉」而看不出任何变化。
     func undo() {
-        guard let domain = undoJournal.popLast() else {
-            refreshSelectionOverlay()
-            onChange?()
-            return
-        }
-        switch domain {
-        case .strokes:
-            if let sync = store.undo() {
-                apply(sync)
-                scheduleAutosave()
-                redoJournal.append(.strokes)
+        while let domain = undoJournal.popLast() {
+            switch domain {
+            case .strokes:
+                if let sync = store.undo() {
+                    apply(sync)
+                    scheduleAutosave()
+                    redoJournal.append(.strokes)
+                    return finishUndoRedo()
+                }
+            case .nodes:
+                if let sync = content.undo() {
+                    applyContent(sync)
+                    scheduleAutosave()
+                    redoJournal.append(.nodes)
+                    return finishUndoRedo()
+                }
             }
-        case .nodes:
-            if let sync = content.undo() {
-                applyContent(sync)
-                scheduleAutosave()
-                redoJournal.append(.nodes)
-            }
         }
-        refreshSelectionOverlay()
-        onChange?()
+        finishUndoRedo()
     }
 
     func redo() {
-        guard let domain = redoJournal.popLast() else {
-            refreshSelectionOverlay()
-            onChange?()
-            return
-        }
-        switch domain {
-        case .strokes:
-            if let sync = store.redo() {
-                apply(sync)
-                scheduleAutosave()
-                undoJournal.append(.strokes)
+        while let domain = redoJournal.popLast() {
+            switch domain {
+            case .strokes:
+                if let sync = store.redo() {
+                    apply(sync)
+                    scheduleAutosave()
+                    undoJournal.append(.strokes)
+                    return finishUndoRedo()
+                }
+            case .nodes:
+                if let sync = content.redo() {
+                    applyContent(sync)
+                    scheduleAutosave()
+                    undoJournal.append(.nodes)
+                    return finishUndoRedo()
+                }
             }
-        case .nodes:
-            if let sync = content.redo() {
-                applyContent(sync)
-                scheduleAutosave()
-                undoJournal.append(.nodes)
-            }
         }
+        finishUndoRedo()
+    }
+
+    private func finishUndoRedo() {
         refreshSelectionOverlay()
         onChange?()
     }
 
     func clear() {
-        let strokeDepth = store.undoDepth
+        let strokeMark = store.undoMark
         let sync = store.clear()
-        noteStrokeMutation(from: strokeDepth)
+        noteStrokeMutation(from: strokeMark)
         if !sync.isEmpty {
             apply(sync)
             scheduleAutosave()
         }
-        let contentDepth = content.undoDepth
+        let contentMark = content.undoMark
         let contentSync = content.clear()
-        noteContentMutation(from: contentDepth)
+        noteContentMutation(from: contentMark)
         if !contentSync.isEmpty {
             applyContent(contentSync)
             scheduleAutosave()
@@ -652,11 +796,11 @@ final class DrawingController: NSObject {
     /// 直接提交一笔（点列已是世界坐标+压力）。返回提交的 Stroke。
     @discardableResult
     func addStroke(points: [StrokePoint], style: StrokeStyle) -> Stroke? {
-        let strokeDepth = store.undoDepth
+        let strokeMark = store.undoMark
         guard let (stroke, sync) = store.addSynthetic(
             points: points, style: style, tolerance: currentTolerance()
         ) else { return nil }
-        noteStrokeMutation(from: strokeDepth)
+        noteStrokeMutation(from: strokeMark)
         apply(sync)
         scheduleAutosave()
         onChange?()
@@ -766,11 +910,30 @@ final class DrawingController: NSObject {
         onChange?()
     }
 
-    private func scheduleAutosave() {
+    /// 落盘最晚时刻：长笔画不能把待存档无限推迟下去
+    private var autosaveDeadline: CFTimeInterval = 0
+
+    private func scheduleAutosave(delay: TimeInterval = 0.5) {
+        // 排一次存档 == 声明「内容变了」。把标脏放在这里而不是各个变更点，
+        // 就不会有哪条变更路径（undo/redo/恢复快照/节点编辑）忘记标脏。
+        mutationCounter &+= 1
+        if saveWork == nil { autosaveDeadline = CACurrentMediaTime() + 3 }
         saveWork?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.fireAutosave() }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            // 笔还在纸上就再等等：saveHandler 会发布 @Published，整轮 SwiftUI
+            // 更新会插在两批 coalesced touch 之间，直接变成笔下的一次卡顿。
+            // 手写节奏是「笔画 150~400ms + 间隔 80~200ms」，500ms 防抖有很大概率
+            // 正好落在下一笔中间。3 秒兜底防止长笔永不落盘。
+            if self.isLiveStrokeActive, CACurrentMediaTime() < self.autosaveDeadline {
+                self.scheduleAutosave(delay: 0.15)
+                return
+            }
+            self.saveWork = nil
+            self.fireAutosave()
+        }
         saveWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     /// 立刻执行待定的自动存档（切后台时调，不等 500ms 防抖）
@@ -781,7 +944,8 @@ final class DrawingController: NSObject {
     }
 
     private func fireAutosave() {
-        guard let id = documentID else { return }
+        guard let id = documentID, mutationCounter != savedMutationCounter else { return }
+        savedMutationCounter = mutationCounter
         saveHandler?(id, store.strokes, content.nodes)
     }
 
@@ -825,9 +989,9 @@ final class DrawingController: NSObject {
     func seedNodeForTest(kind: ContentNodeKind, frame: CGRect, fill: RGBA = .blue) {
         guard content.nodes.count < Self.maxNodes, canvas != nil else { return }
         let node = ContentNode(kind: kind, frame: frame, fill: fill)
-        let contentDepth = content.undoDepth
+        let contentMark = content.undoMark
         content.add(node)
-        noteContentMutation(from: contentDepth)
+        noteContentMutation(from: contentMark)
         placeNodeView(node)
     }
     #endif
@@ -839,9 +1003,9 @@ final class DrawingController: NSObject {
         if !sync.removedIDs.isEmpty {
             strokeView.removeMeshes(ids: sync.removedIDs)
         }
-        for u in sync.upserts {
-            strokeView.upsertMesh(id: u.id, mesh: u.mesh, bounds: u.bounds, kind: u.kind)
-        }
+        // 批量下发：LOD 扫描一次可达上千笔，逐笔 upsert 会做上千次
+        // 「记空洞 -> 可能触发整库 compact」的循环（10k 笔实测 ~165ms 卡顿）
+        strokeView.upsertMeshes(sync.upserts)
         for m in sync.inPlace {
             strokeView.updateMeshInPlace(id: m.id, mesh: m.mesh, bounds: m.bounds)
         }
@@ -922,9 +1086,9 @@ final class DrawingController: NSObject {
             width: frameSize.width, height: frameSize.height
         )
         let node = ContentNode(kind: kind, frame: frame, text: text, fill: fill, imageFile: imageFile)
-        let contentDepth = content.undoDepth
+        let contentMark = content.undoMark
         content.add(node)
-        noteContentMutation(from: contentDepth)
+        noteContentMutation(from: contentMark)
         placeNodeView(node)
         content.select(id: node.id)
         store.clearSelection()
@@ -1009,9 +1173,9 @@ final class DrawingController: NSObject {
         case .ended:
             guard let drag = nodeDrag else { return }
             nodeDrag = nil
-            let contentDepth = content.undoDepth
+            let contentMark = content.undoMark
             let sync = content.move(id: drag.id, by: drag.totalDelta)
-            noteContentMutation(from: contentDepth)
+            noteContentMutation(from: contentMark)
             // 模型从旧框 + 同量位移，结果与预览 view.frame 一致，无需回写视图
             if !sync.isEmpty { scheduleAutosave() }
             onChange?()
@@ -1109,9 +1273,9 @@ extension DrawingController: UITextViewDelegate {
         guard let nodeView = textView.ancestorContentNode() else { return }
         let text = textView.text ?? ""
         nodeView.accessibilityValue = text.isEmpty ? nil : text
-        let contentDepth = content.undoDepth
+        let contentMark = content.undoMark
         content.setText(id: nodeView.nodeID, text: text)
-        noteContentMutation(from: contentDepth)
+        noteContentMutation(from: contentMark)
         scheduleAutosave()
         onChange?()
     }

@@ -237,13 +237,18 @@ final class InfiniteCanvasView: UIView {
             recognizer.setTranslation(.zero, in: self)
             // 双指 pan 时 translation 是质心位移，天然支持“双指拖动画布”
             setCamera(_camera.panned(by: CGSize(width: delta.x, height: delta.y)), transient: true)
-        case .ended, .cancelled, .failed:
+        case .ended:
             if isInertiaEnabled {
                 let v = recognizer.velocity(in: self)
                 startInertia(velocity: CGPoint(x: v.x, y: v.y))
             } else {
                 notify(transient: false)
             }
+        case .cancelled, .failed:
+            // 取消 ≠ 松手：笔落屏时 DrawingController 会禁用 pan，UIKit 随即把
+            // 进行中的 pan 置为 .cancelled。把它当 .ended 处理会用最后的速度甩出惯性，
+            // 于是画布在笔尖下滑走，笔迹被拉斜。来电/切后台的系统取消同理。
+            notify(transient: false)
         default:
             break
         }
@@ -356,11 +361,22 @@ final class InfiniteCanvasView: UIView {
         inertiaVelocity = .zero
     }
 
+    /// 触摸落屏即冻结画布（UIScrollView 同语义）。没有惯性在跑时零开销。
+    /// 必须在 touchesBegan 而不是 beginEdit 里调：后者要等手势识别，
+    /// 那时最前面几个采样点已经被滑动的相机换算歪了。
+    func stopInertia() {
+        guard inertiaLink != nil else { return }
+        cancelInertia()
+        notify(transient: false)
+    }
+
     // MARK: - 键盘
 
     override var canBecomeFirstResponder: Bool { true }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        // 手指/笔一落屏就停住惯性滑动（pan 识别器要挪够 ~10pt 才 began，等它太晚）
+        stopInertia()
         // 首次触摸即抢焦点，保证快捷键可用（文本编辑时会由输入框接管）
         if window != nil, !isFirstResponder {
             _ = becomeFirstResponder()

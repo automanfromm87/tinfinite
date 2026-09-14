@@ -33,12 +33,22 @@ nonisolated struct StrokeSampler {
 
     /// 展示用 spine = 确认 spine + 预测尾巴（预测点用最后压力/倾斜算笔尖）。
     /// 预测点每事件刷新，只影响 live 预览，不进存档。
-    /// 点按中同样坍缩（并压住预测尾巴），live 与提交一致，无闪变。
+    ///
+    /// 点按窗口内（位移 < tapSlop）只压住**预测尾巴**，不压真实 spine：
+    /// 预测点是外推的，相机若在点按中途移动会被映射到很远的世界点，画出假线；
+    /// 而真实 spine 必须立刻可见——否则从落笔到走完 tapSlop(10pt) 的这段时间
+    /// （实测 42~129ms，慢写时更久）墨迹会冻成一个点，然后整段「弹」出来，
+    /// 这正是「书写很卡」最直观的来源。
     var displaySpine: [SpinePoint] {
-        if isTap, let first = spine.first { return [first] }
-        guard !predictedScreen.isEmpty else { return spine }
+        let tail = predictedTail
+        return tail.isEmpty ? spine : spine + tail
+    }
+
+    /// 只取预测尾巴（增量网格构建器用：确认段只追加，尾巴每事件整段替换）
+    var predictedTail: [SpinePoint] {
+        if isTap || predictedScreen.isEmpty { return [] }
         let nib = style.nib(pressure: lastPressure, altitude: lastAltitude)
-        return spine + predictedScreen.map {
+        return predictedScreen.map {
             SpinePoint(center: worldConverter($0), width: nib.width, alpha: nib.alpha)
         }
     }
@@ -94,10 +104,19 @@ nonisolated struct StrokeSampler {
         } else {
             accept(screen: screen, pressure: pressure, altitude: altitude)
         }
-        // 点按坍缩：手指在屏幕上没动过 -> 落笔单点（无论相机动没动）。
-        // raw 点列保留原样（硬件实测存档）；spine 为空（未 begin 的误调）则不动。
-        if isTap, let first = spine.first {
-            spine = [first]
+        // 点按坍缩：手指基本没动（< tapSlop）**且相机在落笔期间真的移动过**
+        // -> 世界 spine 里的位移全部来自相机，不是笔迹，坍缩为落笔单点。
+        //
+        // 为什么要加「相机动过」这一条：无条件坍缩会把所有短于 tapSlop(10pt) 的
+        // 真实笔画（CJK 的点/顿/短撇经常只有 5~9pt）静默压成一个圆点并落盘 ——
+        // 那是数据丢失，不是防抖。相机静止时 worldConverter(downScreen) 与
+        // spine[0].center 逐位相等（OneEuro 首样本原样返回），判据精确无歧义。
+        if isTap, let first = spine.first, let down = downScreen {
+            let downNow = worldConverter(down)
+            let cameraDrift = hypot(downNow.x - first.center.x, downNow.y - first.center.y)
+            if cameraDrift > 1e-9 {
+                spine = [first]
+            }
         }
         predictedScreen = []
     }

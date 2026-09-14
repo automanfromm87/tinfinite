@@ -367,6 +367,115 @@ do {
     }
 }
 
+// ---------- 14. 增量 live 网格 == 全量 tessellate ----------
+// 这是整个 live 管线的正确性支点：LiveStrokeMesh 每事件只重算脏尾巴，
+// 必须与 StrokeGeometry.tessellate(displaySpine) 的输出逐顶点、逐索引相同
+// （含 grain 抖动序号），否则 live 预览与提交后的墨迹会对不上。
+do {
+    func drive(
+        brush: BrushKind, grain: CGFloat, tolerance: CGFloat,
+        predictedCount: Int, jitter: Bool, label: String
+    ) {
+        var style = StrokeStyle.pen(width: 8)
+        style.kind = brush
+        style.grain = grain
+        var sampler = StrokeSampler()
+        sampler.style = style
+        var builder = LiveStrokeMesh()
+        builder.begin(style: style, tolerance: tolerance)
+
+        var mismatches = 0
+        var dirtyStarts: [Int] = []
+        var events = 0
+        let dt = 1.0 / 240.0
+        var t = 0.0
+        func pos(_ i: Int) -> CGPoint {
+            let x = CGFloat(i) * 2.4
+            let y = jitter ? 40 * sin(CGFloat(i) * 0.13) + 3 * sin(CGFloat(i) * 1.7) : 0
+            return CGPoint(x: x, y: y)
+        }
+        func verify() {
+            events += 1
+            builder.update(confirmed: sampler.spine, predicted: sampler.predictedTail)
+            let full = StrokeGeometry.tessellate(
+                spine: sampler.displaySpine, color: style.color,
+                flattenTolerance: tolerance, grain: style.grain
+            )
+            dirtyStarts.append(builder.dirtyVertexStart)
+            guard full.vertices.count == builder.vertices.count,
+                  full.indices.count == builder.indices.count
+            else { mismatches += 1; return }
+            for k in full.vertices.indices {
+                let a = full.vertices[k], b = builder.vertices[k]
+                if a.x != b.x || a.y != b.y || a.r != b.r || a.g != b.g || a.b != b.b || a.a != b.a {
+                    mismatches += 1
+                    return
+                }
+            }
+            if full.indices != builder.indices { mismatches += 1 }
+        }
+
+        sampler.begin(screen: pos(0), pressure: 0.6, altitude: .pi / 2, azimuth: 0, time: t)
+        verify()
+        var i = 1
+        // 120Hz 事件，每事件 2 个 coalesced 点（240Hz 笔）
+        for _ in 0..<180 {
+            for _ in 0..<2 {
+                t += dt
+                sampler.append(screen: pos(i), pressure: 0.6, altitude: .pi / 2, azimuth: 0, time: t)
+                i += 1
+            }
+            if predictedCount > 0 {
+                sampler.setPredicted((1...predictedCount).map { pos(i + $0 * 2) })
+            }
+            verify()
+        }
+        t += dt
+        sampler.end(screen: pos(i), pressure: 0.4, altitude: .pi / 2, azimuth: 0, time: t)
+        verify()
+
+        check(mismatches == 0, "\(label): incremental == full (\(mismatches)/\(events) events differ)")
+        // 增量的意义在于脏区不随笔长增长：后半程的重传起点必须紧贴末尾
+        let lastDirty = dirtyStarts[dirtyStarts.count - 1]
+        let lastTotal = builder.vertices.count
+        check(
+            lastTotal - lastDirty < 260,
+            "\(label): dirty tail stays bounded (rebuilt \(lastTotal - lastDirty) of \(lastTotal) verts)"
+        )
+    }
+
+    drive(brush: .pen, grain: 0, tolerance: 0.35, predictedCount: 0, jitter: false, label: "pen/straight")
+    drive(brush: .pen, grain: 0, tolerance: 0.35, predictedCount: 6, jitter: true, label: "pen/cursive+predicted")
+    drive(brush: .pencil, grain: 0.35, tolerance: 0.35, predictedCount: 6, jitter: true, label: "pencil/grain")
+    drive(brush: .pen, grain: 0, tolerance: 0.02, predictedCount: 8, jitter: true, label: "pen/deep-zoom tolerance")
+
+    // 退化输入：空 / 单点 / 重合点，必须与 tessellate 一致
+    var b = LiveStrokeMesh()
+    b.begin(style: .pen(width: 8), tolerance: 0.35)
+    b.update(confirmed: [], predicted: [])
+    check(b.vertices.isEmpty && b.indices.isEmpty, "live mesh empty input")
+    let dot = [SpinePoint(center: CGPoint(x: 3, y: 4), width: 8)]
+    b.update(confirmed: dot, predicted: [])
+    let fullDot = StrokeGeometry.tessellate(spine: dot, color: RGBA.black, flattenTolerance: 0.35)
+    check(
+        b.vertices.count == fullDot.vertices.count && b.indices == fullDot.indices,
+        "live mesh single point == disc"
+    )
+    // 单点 -> 真线：退化分支之后必须整段重建，不能沿用圆盘布局
+    let line = dot + [SpinePoint(center: CGPoint(x: 33, y: 4), width: 8),
+                      SpinePoint(center: CGPoint(x: 63, y: 10), width: 8)]
+    b.update(confirmed: line, predicted: [])
+    let fullLine = StrokeGeometry.tessellate(spine: line, color: RGBA.black, flattenTolerance: 0.35)
+    check(
+        b.vertices.count == fullLine.vertices.count && b.indices == fullLine.indices,
+        "live mesh disc -> ribbon rebuild"
+    )
+    // 采样器回退（点按坍缩）：确认点变少也不能越界/错位
+    b.update(confirmed: dot, predicted: [])
+    check(b.vertices.count == fullDot.vertices.count, "live mesh handles spine shrink")
+}
+
+
 if failures == 0 { print("ALL DRAWING-MATH TESTS PASSED") }
 else { print("\(failures) FAILURES") }
 exit(failures == 0 ? 0 : 1)

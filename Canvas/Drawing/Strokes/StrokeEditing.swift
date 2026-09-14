@@ -7,7 +7,7 @@ import Foundation
 // MARK: - 线段基础（文件内共享）
 
 /// 点到线段距离
-private func pointToSegmentDistance(_ p: CGPoint, _ a: CGPoint, _ b: CGPoint) -> CGFloat {
+nonisolated private func pointToSegmentDistance(_ p: CGPoint, _ a: CGPoint, _ b: CGPoint) -> CGFloat {
     let abx = b.x - a.x
     let aby = b.y - a.y
     let denom = abx * abx + aby * aby
@@ -20,7 +20,7 @@ private func pointToSegmentDistance(_ p: CGPoint, _ a: CGPoint, _ b: CGPoint) ->
 }
 
 /// 点到折线距离（单点折线退化为点距，空折线返回无穷）
-private func pointToPolylineDistance(_ p: CGPoint, _ poly: [CGPoint]) -> CGFloat {
+nonisolated private func pointToPolylineDistance(_ p: CGPoint, _ poly: [CGPoint]) -> CGFloat {
     guard !poly.isEmpty else { return .infinity }
     if poly.count == 1 { return hypot(p.x - poly[0].x, p.y - poly[0].y) }
     var best = CGFloat.infinity
@@ -31,7 +31,7 @@ private func pointToPolylineDistance(_ p: CGPoint, _ poly: [CGPoint]) -> CGFloat
 }
 
 /// 两线段是否相交（含端点接触）
-private func segmentsIntersect(_ p1: CGPoint, _ p2: CGPoint, _ p3: CGPoint, _ p4: CGPoint) -> Bool {
+nonisolated private func segmentsIntersect(_ p1: CGPoint, _ p2: CGPoint, _ p3: CGPoint, _ p4: CGPoint) -> Bool {
     let eps: CGFloat = 1e-9
     func orient(_ a: CGPoint, _ b: CGPoint, _ c: CGPoint) -> CGFloat {
         (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
@@ -56,7 +56,7 @@ private func segmentsIntersect(_ p1: CGPoint, _ p2: CGPoint, _ p3: CGPoint, _ p4
 }
 
 /// 点是否在多边形内（射线法，多边形自动闭合；<3 点恒 false）
-private func pointInPolygon(_ p: CGPoint, _ poly: [CGPoint]) -> Bool {
+nonisolated private func pointInPolygon(_ p: CGPoint, _ poly: [CGPoint]) -> Bool {
     guard poly.count >= 3 else { return false }
     var inside = false
     var j = poly.count - 1

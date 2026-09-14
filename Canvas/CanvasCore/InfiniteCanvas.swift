@@ -115,7 +115,11 @@ final class CanvasContainerView: UIView {
     func applyPaper(_ paper: PaperTheme, gridStyle: GridStyle) {
         self.paper = paper
         self.gridStyle = gridStyle
-        backgroundColor = paper.backgroundColor(for: traitCollection)
+        let background = paper.backgroundColor(for: traitCollection)
+        backgroundColor = background
+        // 网格层不透明并自己铺底：网格开着时它就是纸面，
+        // 底下的容器背景完全不参与合成（少一层全屏 blend）
+        grid.paperColor = background
         grid.isHidden = !gridStyle.showsGrid
         grid.style = gridStyle
         grid.darkBackground = paper.isDark(for: traitCollection)
